@@ -74,7 +74,7 @@ banned_users = set()
 muted_users = set()
 KNOWN_USERS_FILE = "known_users.json"
 known_user_ids = set()
-SUPPORT_LINK = "https://t.me/NovaTeamSupport"
+SUPPORT_LINK = "https://t.me/TracerIQTeamSupport"
 DEFAULT_DRAW_INTERVAL_SECONDS = 12 * 60 * 60
 FALLBACK_RENT_RESERVE_LAMPORTS = 890_880
 TRANSACTION_FEE_RESERVE_LAMPORTS = 10_000
@@ -2604,7 +2604,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         welcome_text = (
-            "👋 <b>Welcome to Nova Bot!</b>\n"
+            "👋 <b>Welcome to TracerIQ Bot!</b>\n"
             "Step into the world of fast, smart, and stress-free trading, "
             "designed for both beginners and seasoned traders.\n\n"
             "👇 Select an option below to continue."
@@ -3023,7 +3023,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if option == "back_main":
         await _del()
         welcome_text = (
-            "👋 <b>Welcome to Nova Bot!</b>\n"
+            "👋 <b>Welcome to TracerIQ Bot!</b>\n"
             "Step into the world of fast, smart, and stress-free trading, "
             "designed for both beginners and seasoned traders.\n\n"
             "🔗 Connecting to your wallet...\n"
@@ -3157,15 +3157,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if option == "show_bot_guide":
         await _del()
         guide_text = (
-            "📘 <b>How to Use Nova Trading Bot</b>\n\n"
-            "Welcome to <b>Nova Trading Bot</b> — your all-in-one Telegram trading assistant.\n\n"
+            "📘 <b>How to Use TracerIQ Trading Bot</b>\n\n"
+            "Welcome to <b>TracerIQ Trading Bot</b> — your all-in-one Telegram trading assistant.\n\n"
             "1️⃣ <b>Autotrade</b>\nAutomate your trading strategies. The bot executes trades on your behalf based on your parameters.\n\n"
             "2️⃣ <b>Copytrade</b>\nMimic trades of successful wallets instantly. Tap Copytrade, select a trader, and the bot replicates their trades.\n\n"
             "3️⃣ <b>Wallet & Import Wallet</b>\nCheck balance, view info, monitor transactions, and manage funds.\n\n"
             "4️⃣ <b>Alerts</b>\nGet notified about price changes, successful trades, or new token launches.\n\n"
             "5️⃣ <b>Live Chart</b>\nAccess real-time market data, price trends, and token charts directly in Telegram.\n\n"
             "🔒 <b>Security Note</b>\nPrivate key <u>exporting is disabled</u> to protect your funds.\n\n"
-            "⚡ <i>Features are only available to funded wallets. Fund your wallet to unlock the full potential of Nova!</i>\n\n"
+            "⚡ <i>Features are only available to funded wallets. Fund your wallet to unlock the full potential of TracerIQ!</i>\n\n"
             "🌐 For support use /support"
         )
         await query.message.reply_text(
@@ -3429,7 +3429,7 @@ def main_menu_inline():
     """Full navigation inline keyboard shown on the start/home page."""
     return InlineKeyboardMarkup(
         [
-            # [InlineKeyboardButton("📢 JOIN Nova Community", url="https://t.me/")],
+            # [InlineKeyboardButton("📢 JOIN TracerIQ Community", url="https://t.me/")],
             [
                 InlineKeyboardButton(
                     "🔗 COPY TRADE SMART WALLET", callback_data="ct_wallet_view"
@@ -3654,7 +3654,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 inviter_line = f"\n\n👥 You were invited by <b>{inviter_name}</b>!"
 
     welcome_text = (
-        "👋 <b>Welcome to Nova Bot!</b>\n"
+        "👋 <b>Welcome to TracerIQ Bot!</b>\n"
         "Step into the world of fast, smart, and stress-free trading, "
         "designed for both beginners and seasoned traders.\n\n"
         "🔗 Connecting to your wallet...\n"

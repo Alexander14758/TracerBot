@@ -17,6 +17,7 @@ import base58
 import json
 import requests
 import asyncio
+from contextvars import ContextVar
 from dotenv import load_dotenv
 from nacl.secret import SecretBox
 from nacl.signing import SigningKey
@@ -35,12 +36,13 @@ from spl.token.instructions import (
 )
 from pycoingecko import CoinGeckoAPI
 from telegram import (
+    Bot as TelegramBot,
     Update,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     InlineKeyboardButton,
+    InlineKeyboardMarkup as TelegramInlineKeyboardMarkup,
 )
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -62,6 +64,83 @@ _REPLY_ACTIONS_PATH = Path(__file__).resolve().parent / ".reply_keyboard_actions
 _reply_action_counter = 0
 _reply_actions_by_token = {}
 _reply_tokens_by_action = {}
+_bot_message_ids_by_private_chat = {}
+_bot_message_tracking_lock = asyncio.Lock()
+_preserve_multiple_bot_messages = ContextVar(
+    "preserve_multiple_bot_messages", default=False
+)
+
+
+_telegram_send_message = getattr(
+    TelegramBot,
+    "_traceriq_original_send_message",
+    TelegramBot.send_message,
+)
+_telegram_send_photo = getattr(
+    TelegramBot,
+    "_traceriq_original_send_photo",
+    TelegramBot.send_photo,
+)
+
+
+async def _track_private_bot_message(bot, message):
+    chat = getattr(message, "chat", None)
+    message_id = getattr(message, "message_id", None)
+    if getattr(chat, "type", None) != "private" or message_id is None:
+        return
+    async with _bot_message_tracking_lock:
+        if not _preserve_multiple_bot_messages.get():
+            previous_ids = _bot_message_ids_by_private_chat.pop(chat.id, [])
+            for previous_id in previous_ids:
+                try:
+                    await bot.delete_message(
+                        chat_id=chat.id,
+                        message_id=previous_id,
+                    )
+                except Exception:
+                    pass
+        message_ids = _bot_message_ids_by_private_chat.setdefault(chat.id, [])
+        if message_id not in message_ids:
+            message_ids.append(message_id)
+
+
+async def _tracked_send_message(bot, *args, **kwargs):
+    message = await _telegram_send_message(bot, *args, **kwargs)
+    await _track_private_bot_message(bot, message)
+    return message
+
+
+async def _tracked_send_photo(bot, *args, **kwargs):
+    message = await _telegram_send_photo(bot, *args, **kwargs)
+    await _track_private_bot_message(bot, message)
+    return message
+
+
+if not getattr(TelegramBot, "_traceriq_message_tracking_installed", False):
+    TelegramBot._traceriq_original_send_message = _telegram_send_message
+    TelegramBot._traceriq_original_send_photo = _telegram_send_photo
+    TelegramBot.send_message = _tracked_send_message
+    TelegramBot.send_photo = _tracked_send_photo
+    TelegramBot._traceriq_message_tracking_installed = True
+
+
+async def _delete_previous_bot_messages(update, context):
+    """Clear the bot's previous private-chat replies before handling a new action."""
+    chat = getattr(update, "effective_chat", None)
+    if getattr(chat, "type", None) != "private":
+        return
+    async with _bot_message_tracking_lock:
+        message_ids = _bot_message_ids_by_private_chat.pop(chat.id, [])
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat.id,
+                message_id=message_id,
+            )
+        except Exception:
+            # A user may have already deleted a message, or Telegram may reject
+            # deletion of a message that is no longer available.
+            pass
 
 
 def _reply_action_key(action: dict) -> str:
@@ -214,13 +293,13 @@ class _ReplyKeyboardInputUpdate:
 
 
 class _ReplyKeyboardQuery:
-    """Callback-shaped adapter so existing action logic can be reused."""
+    """Message-action adapter that replies cleanly after deleting old messages."""
 
     is_reply_button = True
 
-    def __init__(self, source_message, context, action):
+    def __init__(self, source_message, context, action, user=None):
         self.data = action
-        self.from_user = source_message.from_user
+        self.from_user = user or source_message.from_user
         self.message = _ReplyKeyboardMessage(source_message, context)
 
     async def answer(self, *_args, **_kwargs):
@@ -2306,6 +2385,7 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- SETTINGS MENU ---
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_previous_bot_messages(update, context)
     copy_preference_buttons = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🗓 Copy cadence", callback_data="trade_per_day")],
@@ -2344,9 +2424,17 @@ async def button_handler(
     reply_action: str | None = None,
 ):
     if update.callback_query:
-        query = update.callback_query
-        await query.answer()
+        source_query = update.callback_query
+        await source_query.answer()
+        await _delete_previous_bot_messages(update, context)
+        query = _ReplyKeyboardQuery(
+            source_query.message,
+            context,
+            source_query.data,
+            user=source_query.from_user,
+        )
     elif update.message and reply_action is not None:
+        await _delete_previous_bot_messages(update, context)
         query = _ReplyKeyboardQuery(update.message, context, reply_action)
     else:
         return
@@ -2867,6 +2955,15 @@ async def button_handler(
                     f"❌ Could not send notification to user <code>{target_id}</code>: {e}",
                     parse_mode="HTML",
                 )
+        return
+
+    if option == "support_contact":
+        await query.message.reply_text(
+            "☎️Support Contact\n\n"
+            "Need help? Our support team is always available to assist you.\n\n"
+            "Simply click the button below to contact our support team anytime.",
+            reply_markup=support_contact_keyboard(),
+        )
         return
 
     # Check for deposits on ANY button click
@@ -3740,9 +3837,43 @@ async def button_handler(
 
 # ---- Helpers ----
 def main_menu_markup():
-    """Persistent Home shortcut shown below TracerIQ messages."""
+    """Persistent Home and Support shortcuts shown below TracerIQ messages."""
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("⌂ Home", callback_data="back_main")]]
+        [
+            [
+                InlineKeyboardButton("⌂ Home", callback_data="back_main"),
+                InlineKeyboardButton("☎️ Support", callback_data="support_contact"),
+            ]
+        ]
+    )
+
+
+def start_links_keyboard():
+    """External inline links displayed under the /start welcome image."""
+    return TelegramInlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "📢 Subscribe to TracerIQ Channel",
+                    url="https://t.me/TracerlQ",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🌐 Open TracerIQ Web",
+                    url="https://traceriq.xyz",
+                )
+            ],
+        ]
+    )
+
+
+def support_contact_keyboard():
+    return TelegramInlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("☎️ Contact Support", url=SUPPORT_LINK)],
+            [InlineKeyboardButton("↩ Back to Menu", callback_data="back_main")],
+        ]
     )
 
 
@@ -3763,6 +3894,7 @@ def main_menu_inline():
                 # InlineKeyboardButton("📡 Live Market", callback_data="show_live_chart"),
                 InlineKeyboardButton("🤝 Invite Traders", callback_data="refer_earn"),
             ],
+            [InlineKeyboardButton("☎️ Support", callback_data="support_contact")],
         ]
     )
 
@@ -3970,6 +4102,7 @@ def format_token_details(pair_data, wallet_balance=0, chain_sym="SOL"):
 
 # --- /start ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_previous_bot_messages(update, context)
     user = update.effective_user
     user_id = user.id
     if user_id in banned_users:
@@ -4014,43 +4147,52 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Choose a destination below."
     )
 
-    if update.message:
-        with START_BANNER_PATH.open("rb") as banner:
-            await update.message.reply_photo(
-                photo=banner,
-                caption=welcome_text,
-                parse_mode="HTML",
+    start_links = start_links_keyboard()
+    preserve_token = _preserve_multiple_bot_messages.set(True)
+    try:
+        if update.message:
+            with START_BANNER_PATH.open("rb") as banner:
+                await update.message.reply_photo(
+                    photo=banner,
+                    caption=welcome_text,
+                    parse_mode="HTML",
+                    reply_markup=start_links,
+                )
+            await update.message.reply_text(
+                "Choose an option from the keyboard below.",
                 reply_markup=main_menu_inline(),
             )
-    elif update.callback_query:
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-        with START_BANNER_PATH.open("rb") as banner:
-            await context.bot.send_photo(
-                chat_id=update.callback_query.message.chat_id,
-                photo=banner,
-                caption=welcome_text,
-                parse_mode="HTML",
+        elif update.callback_query:
+            chat_id = update.callback_query.message.chat_id
+            with START_BANNER_PATH.open("rb") as banner:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=banner,
+                    caption=welcome_text,
+                    parse_mode="HTML",
+                    reply_markup=start_links,
+                )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Choose an option from the keyboard below.",
                 reply_markup=main_menu_inline(),
             )
+    finally:
+        _preserve_multiple_bot_messages.reset(preserve_token)
 
     # --- /support ---
 
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_previous_bot_messages(update, context)
     user_id = update.effective_user.id
     if user_id in banned_users:
         return
     await update.message.reply_text(
-        "◈ <b>TRACERIQ  /  SUPPORT</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Need help with your workspace? Use the button below to open TracerIQ support.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔧 Reach Support", url=SUPPORT_LINK)]]
-        ),
+        "☎️Support Contact\n\n"
+        "Need help? Our support team is always available to assist you.\n\n"
+        "Simply click the button below to contact our support team anytime.",
+        reply_markup=support_contact_keyboard(),
     )
     # clear states
     context.user_data.pop("awaiting_dummy", None)
@@ -4059,6 +4201,7 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Message handler ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_previous_bot_messages(update, context)
     user_id = update.effective_user.id
 
     # Global ban check
@@ -5195,6 +5338,7 @@ async def background_deposit_monitor(context: ContextTypes.DEFAULT_TYPE):
 
 # --- Admin Panel ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _delete_previous_bot_messages(update, context)
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         return

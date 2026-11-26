@@ -2110,12 +2110,12 @@ def start_links_keyboard():
                     url="https://t.me/TracerlQ",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    "🌐 Open TracerIQ Web",
-                    url="https://traceriq.xyz",
-                )
-            ],
+            #[
+                #InlineKeyboardButton(
+                  #  "🌐 Open TracerIQ Web",
+                  #url="https://traceriq.xyz",
+               # )
+           #],
         ]
     )
 
